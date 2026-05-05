@@ -230,7 +230,7 @@ Small Python helper. Not a polling loop — there's no loop, the core calls the 
 
 - A `Plugin` base class with a `reconcile(scope)` method to override
 - Manifest validation helpers (`config_schema` resolution against Pydantic models)
-- Common types: `LockStatus`, `Reasons`, `ReconcileResult`
+- Common types: `Scope` (the argument to `reconcile`), `LockStatus`, `Reasons`, `ReconcileResult`
 - Optional helpers for HTTP clients with timeout/retry, since plugins almost always call out to some external service
 
 A plugin is a Python file. Importable shape:
@@ -412,7 +412,7 @@ curfew agent            install <type> <device> | uninstall <device> | list
 curfew agent token      mint <device> | list <device> | revoke <device> <id>
 curfew agent publish    <type> <version> <file>             # publish a new version of agent code
 
-curfew plugin           assign <type> | unassign <type> | pause <type> | unpause <type> | list | types
+curfew plugin           assign <type> [<instance_id>] | unassign <type> [<instance_id>] | pause <type> [<instance_id>] | unpause <type> [<instance_id>] | list | types
 
 curfew setting          list | get | set
 curfew lock             <user>
@@ -420,6 +420,7 @@ curfew unlock           <user>
 curfew status                                                # human-readable summary
 
 # Convention: every list/show/status command accepts --json for machine-readable output.
+# Plugin commands take an optional <instance_id> positional arg; omitted means the literal "default" instance. So `curfew plugin pause adguard` works for the common case, and `curfew plugin pause smart-plug livingroom` addresses a specific non-default instance.
 ```
 
 ## Repository layout

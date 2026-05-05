@@ -228,7 +228,7 @@ Any operator action that affects the device — lock toggle, settings change, co
 
 ## ADR-013: Plugins are drop-in Python modules in `CURFEW_PLUGINS_DIRS`
 
-**Decided:** in-core plugins are Python packages dropped into any directory listed in `CURFEW_PLUGINS_DIRS` — a colon-separated list (PATH-style). Curfew-core scans each directory in order at startup, reads each subdirectory's `manifest.toml`, optionally installs `requirements.txt` into the shared Python environment, imports `plugin.py`, finds the class subclassing `Plugin`, and registers it under its `type` name. If the same `type` is declared in multiple dirs, later entries win.
+**Decided:** in-core plugins are Python packages dropped into any directory listed in `CURFEW_PLUGINS_DIRS` — a colon-separated list (PATH-style). Curfew-core scans each directory in order at startup, reads each subdirectory's `manifest.toml`, optionally installs `requirements.txt` into the shared Python environment, imports `plugin.py`, finds the entry-point class (the leaf class in the `Plugin` subclass hierarchy, so plugin authors can have internal helper base classes), and registers it under its `type` name. If the same `type` is declared in multiple dirs, later entries win.
 
 The default value of `CURFEW_PLUGINS_DIRS` is the curfew repo's `plugins/` directory — so curfew ships with `adguard`, `smart-plug`, etc. discoverable out of the box, and operator-authored plugins drop in alongside them. Operators who prefer keeping their plugins outside the repo can append additional paths.
 

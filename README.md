@@ -1,6 +1,6 @@
 # curfew
 
-A modular, plugin-based tool for managing screentime across the household. 
+A modular, extensible tool for managing screentime across the household. 
 
 ## Tech Stack
 

@@ -143,7 +143,7 @@ Suppose you want a `linux-agent` agent. Steps:
 1. **Pick the SDK flavour.** Linux → `curfew_agent_sdk_python`. (Windows would use the PowerShell SDK; for anything else, Python.)
 2. **Write the reconciler.** Subclass the SDK's agent class, implement `reconcile(state)`, do whatever Linux-specific blocking/killing you want (iptables to localhost, kill processes, deny execute via setfacl, etc.).
 3. **Build a bootstrap installer** — a small shell script that the operator runs on the target machine. It fetches the manifest, verifies hash, installs, registers a systemd timer (or cron, or whatever).
-4. **Publish a version.** `curfew agent publish linux-agent 1.0.0 ./linux-agent-agent.tar` ships the artifact + hash to curfew-core. From now on, `curfew agent install linux-agent <device>` will work.
+4. **Publish a version.** `curfew agent publish linux-agent 1.0.0 ./linux-agent.tar` ships the artifact + hash to curfew-core. From now on, `curfew agent install linux-agent <device>` will work.
 5. **Test it** against `reftest_agent`'s patterns — drop assignment, heartbeat appears, `last_heartbeat` advances on each tick, lock toggles propagate within a tick.
 
 The agent doesn't need to know about plugins or the rule pipeline. It only sees `{locked, reasons, target_apps, config}` and the reconciler dispatches.
