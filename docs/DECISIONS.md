@@ -37,9 +37,9 @@ Short notes on the major design decisions and rejected alternatives. Captures th
 
 **Why bootstrap won:** zero new infrastructure (the bootstrap and agent files live behind the same Traefik that serves the API), one-time per device, self-healing updates, idiomatic for the scale.
 
-## ADR-004: Plugin contract is "poll state, reconcile, optional heartbeat"
+## ADR-004: Plugin contract is "poll state, reconcile, heartbeat"
 
-**Decided:** minimal interface. A plugin authenticates with a bearer token, calls `GET /v1/state` (or filtered variant) on a timer, reconciles its domain to match, and optionally `POST`s heartbeats so the core can show liveness in the UI.
+**Decided:** minimal interface. A plugin authenticates with a bearer token, calls `GET /v1/state/effective/{user}` (or filtered variant) on a timer, reconciles its domain to match, and `POST`s a heartbeat each tick so the core can detect drift between the inventory's expected instances and what's actually checking in (see ADR-008).
 
 **Why minimal:**
 - Lets in-core plugins (AdGuard, smart-plug) and per-device plugins (windows-pc) share the same contract. Deployment differs; the contract doesn't.
@@ -59,11 +59,13 @@ Short notes on the major design decisions and rejected alternatives. Captures th
 
 **Why this is still simple enough:** SQLModel gives Pydantic-style models with `create_all()`. The V1 schema is three small tables. Backups are `cp` of a single file. Inspection is `sqlite3 state.sqlite '.dump'` or any GUI.
 
-## ADR-006: Per-plugin bearer tokens from day one
+## ADR-006: Per-instance bearer tokens from day one
 
-**Decided:** each plugin gets its own token, even though V1 only has one plugin (`windows-pc`).
+**Decided:** each plugin instance gets its own bearer token. A second `windows-pc:laptop2` would have a separate token from `windows-pc:gamingrig`. V1 has only one instance so this is invisible at first, but the issuance model is per-instance from day one.
 
-**Why:** small upfront cost (one extra column in a config), big audit/security win later. Per-plugin tokens let us revoke a single compromised PC without nuking the rest, and we can log which plugin made which call.
+**Why:** small upfront cost (one extra row in the `plugin_tokens` table), big audit/security win later. Per-instance tokens let us revoke a single compromised PC without nuking the rest, and we can log which instance made which call.
+
+**What's deferred:** per-instance *read-scope* limits — a `windows-pc:gamingrig` token can currently read all state, not just kid1's slice. Tightening this is on the V5+ list. Issuance is per-instance now; scoping is later.
 
 ## ADR-007: Inventory and runtime state are separate stores
 
@@ -90,7 +92,7 @@ Short notes on the major design decisions and rejected alternatives. Captures th
 Concretely, in V1:
 
 - Each `devices.{name}.plugins` entry in `inventory.yaml` produces one expected plugin instance (e.g. `windows-pc:gamingrig`). In-core plugin types like `adguard` are configured separately and produce their own expected instances.
-- Plugins authenticate with a per-plugin bearer (per ADR-006) and call `POST /v1/plugins/{name}/heartbeat` on every tick. The core records `last_heartbeat` and `last_seen_version`.
+- Plugins authenticate with a per-instance bearer (per ADR-006) and call `POST /v1/plugins/{name}/heartbeat` on every tick. The core records `last_heartbeat` and `last_seen_version`.
 - `GET /v1/plugins` lists expected instances (from inventory) joined with actual heartbeats. Stale or missing heartbeats are visible there as drift.
 
 **Rejected:**
@@ -101,7 +103,7 @@ Concretely, in V1:
 **End-state model (target for later phases, not all in V1):**
 
 - **Plugin types vs instances.** A *type* is the deployable unit (code, bootstrap, version). An *instance* is a runtime entity bound to inventory — `windows-pc` running on `gamingrig` governing `kid1`. Types live in a static registry in the core image; instances live in inventory.
-- **Per-instance scoped tokens.** When you add `windows-pc` to a device's plugin list, the core mints a token scoped to that instance — it can read only that user's effective state and heartbeat only as that instance. V1 still uses per-plugin-type tokens (per ADR-006); per-instance scoping is a future tightening.
+- **Per-instance token read-scope.** When you add `windows-pc` to a device's plugin list, the core mints a token scoped to that instance — it can read only that user's effective state and heartbeat only as that instance. V1 issues per-instance tokens (per ADR-006) but doesn't yet enforce read-scope limits; that tightening lands later.
 - **Type-level capability registry.** Each type declares which device `os` and `type` it applies to, which scopes it supports (`user`, `shared`), and which config keys it requires. Lets the (future) GUI offer constrained dropdowns instead of free-form strings.
 - **Plugins as dumb executors.** A plugin reads its scoped state from the API, reconciles, heartbeats. It does not announce itself, does not carry config that only it knows about — config lives in its inventory record on the core.
 - **Symmetric add/remove ritual.** Adding: edit inventory → core mints a token → operator runs bootstrap. Removing: edit inventory → core revokes token → next agent tick gets 401.

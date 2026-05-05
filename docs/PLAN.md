@@ -8,7 +8,7 @@ CLI- (and eventually web-) driven tool to manage kid screentime across the house
 2. **API-first** — the core HTTP API is the contract. CLI, GUI, plugins, and any future surface are all clients of it.
 3. **Docker-hosted core** — assume the user runs the core as a docker compose stack alongside their other homelab services. Matches the `docker/apps/` pattern.
 4. **CLI today, GUI later** — same API serves both. No refactor needed when the GUI lands.
-5. **Pull-based enforcement** — plugins reconcile against state on a timer. Self-heals through reboots, sleep, and network changes. Push (long-polling) is a future addition.
+5. **Pull-based enforcement** — plugins reconcile against state on a timer. Self-heals through reboots, sleep, and network changes. Push (long-polling / SSE) is a future addition.
 6. **Well-tested** — the core, the CLI, and the plugin agents all have automated tests running in CI.
 
 ## Architecture & topology
@@ -78,13 +78,13 @@ See [DECISIONS.md](DECISIONS.md) ADR-005 (SQLite from V1) and ADR-007 (inventory
 users:
   kid1:
     role: child
-    blocks: [steam, minecraft, youtube]
+    target_apps: [steam, minecraft, youtube]
   parent:
     role: parent
 
 devices:
   gamingrig:
-    owner: kid1            # user that activity here debits; null/omitted = shared
+    owner: kid1            # owner of this device; null/omitted = shared
     type: pc               # pc | laptop | phone | tablet | console | tv
     os: windows            # windows | macos | linux | ios | android
     managed: true
@@ -109,11 +109,11 @@ The inventory is intentionally plugin-agnostic — `apps` describes apps in plug
 *Users:*
 - `name` (the YAML key) — stable identifier used in CLI, API, and UI. Short string (`kid1`), not a real name.
 - `role` — `parent` or `child`. Distinguishes who governs from who is governed; future auth/RBAC keys off this.
-- `blocks` — apps to block when this user is locked. References keys in the `apps` catalog.
+- `target_apps` — apps that get blocked when this user is in an effective-lock state (manual today; out-of-schedule and budget-exhausted in later phases). References keys in the `apps` catalog.
 
 *Devices:*
 - `name` (the YAML key) — used in CLI/UI and as part of plugin instance names (`windows-pc:gamingrig`).
-- `owner` — the user whose schedule/budget activity here debits. Omit (or set null) for shared devices (common-area TV, family tablet); the `--shared` flag governs those as a group from V2 onward.
+- `owner` — the user this device belongs to. For managed devices, also the user whose schedule/budget activity here debits. Omit (or set null) for shared devices (common-area TV, family tablet); the `--shared` flag governs those as a group from V2 onward.
 - `type` — `pc | laptop | phone | tablet | console | tv`. Informs which plugins are applicable; a phone never gets `windows-pc`.
 - `os` — `windows | macos | linux | ios | android`. Selects per-device plugin variants when one exists.
 - `mac` — list. Network-layer identity, stable across IP changes; needed by network-side plugins (DNS sinkhole, router ACL). A device commonly has multiple MACs (laptop with Wi-Fi *and* ethernet; phones/tablets that randomize per network) — all entries identify the same device.
@@ -138,7 +138,7 @@ The inventory is intentionally plugin-agnostic — `apps` describes apps in plug
 |-------|---------|
 | `user_locks` | One row per user. `manual_lock: bool`, `set_at`, `set_by`. |
 | `plugin_instances` | One row per expected instance (derived from inventory on startup/reload). `name` (e.g. `windows-pc:gamingrig`), `last_heartbeat`, `last_seen_version`. |
-| `plugin_tokens` | Per-plugin bearer tokens (per ADR-006). Hashed at rest. |
+| `plugin_tokens` | One token per plugin instance (per ADR-006). Hashed at rest. Read-scope tightening (limiting what each token can read) is a V5+ item. |
 
 V2 adds `schedules`. V3 adds `usage_minutes` (budget tally) and `audit_log`. Migrations are tracked from day one so V2/V3 are additive, not panicked ports.
 
@@ -185,6 +185,8 @@ curfew/
 │   ├── Dockerfile                  # builds curfew_api into a slim image
 │   └── compose.yml                 # for homelab deployment
 ├── docs/
+│   ├── PLAN.md                     # this file — scope and roadmap
+│   ├── DECISIONS.md                # ADRs
 │   ├── api.md                      # API contract (or auto-gen from OpenAPI)
 │   ├── plugin-contract.md          # how to write a plugin
 │   └── topology.md                 # what runs where, how to deploy
@@ -194,7 +196,7 @@ curfew/
 │   ├── ci.yml                      # lint, type-check, pytest (Linux)
 │   └── windows.yml                 # Pester tests on Windows runner
 ├── pyproject.toml
-└── PLAN.md
+└── README.md
 ```
 
 ## Testing strategy
@@ -240,7 +242,7 @@ Pre-commit hooks for lint/format. Type hints required (`mypy --strict` for the c
 
 ### V3 — budgets (additive)
 
-- Plugins gain a heartbeat for input-activity: `POST /v1/heartbeat` when there's recent user input.
+- Plugins gain an activity heartbeat: `POST /v1/plugins/{name}/activity` when there's recent user input. Distinct from the liveness heartbeat at `/v1/plugins/{name}/heartbeat`.
 - Core tallies usage per user, decrements `budget_minutes_remaining` (resets daily/weekly).
 - Effective lock = `manual_lock || out_of_schedule || budget_exhausted`.
 - New tests: budget accounting, heartbeat dedup, activity-window logic.
@@ -264,7 +266,7 @@ Deferred features (no plugin work):
 
 - **Per-device app overrides** — let a single device declare alternate paths/process names for an app in the global catalog. Replace semantics (override list replaces global list for that device, not merge). Deferred until enough installs exist that non-default paths are common in practice.
 - **Long-polling / SSE push** so plugins react in seconds rather than within-the-tick latency.
-- **Per-instance scoped tokens** — V1 uses per-plugin-type tokens (ADR-006); per-instance scoping (a `windows-pc:gamingrig` token can only see kid1's state) is a future tightening.
+- **Per-instance token read-scope** — V1 issues per-instance tokens (ADR-006) for revocation granularity, but they aren't yet limited in what state they can read. Tightening so that a `windows-pc:gamingrig` token can only read kid1's state is deferred.
 
 ## Open questions (decide before V1)
 
@@ -303,5 +305,5 @@ Still open:
 - macOS, Linux, or non-Windows PC enforcement (will come as plugins; not V1).
 - Cloud-account integration (Microsoft Family Safety, Google Family Link).
 - Tamper-resistance against an admin-level kid (assumes kids run as standard Windows users).
-- Real-time push (long-polling/SSE). Pull-only is sufficient for V1–V3.
+- Real-time push (long-polling / SSE). Pull-only is sufficient through V4; push lands in V5+.
 - Multi-tenant / multi-household support.
