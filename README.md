@@ -1,5 +1,16 @@
 # curfew
 
-A modular, plugin-based tool for managing screentime across the household. A small dockerized core service exposes an HTTP API; plugins enforce policy at different layers — Windows PCs, DNS, smart plugs, router ACLs, and more.
+A modular, plugin-based tool for managing screentime across the household. 
 
-In the planning stage. See [docs/PLAN.md](docs/PLAN.md) for the architecture (kernel + features) and [docs/DECISIONS.md](docs/DECISIONS.md) for the design decisions and rejected alternatives.
+## Tech Stack
+
+A small dockerized core service exposes an HTTP API. Two extension surfaces enforce policy at different layers — **agents** that run on a managed device (Windows PCs, Macs) and **plugins** that run in-core (DNS sinkhole, smart plugs, router ACLs, and more).
+
+## Plan
+
+In the planning stage.
+
+- [docs/PLAN.md](docs/PLAN.md) — the architecture (kernel + features).
+- [docs/DECISIONS.md](docs/DECISIONS.md) — design decisions and rejected alternatives (ADRs).
+- [docs/AGENTS.md](docs/AGENTS.md) — how on-device agents work and how to write one.
+- [docs/PLUGINS.md](docs/PLUGINS.md) — how in-core plugins work and how to write one.

@@ -63,13 +63,13 @@ The schema is created in the initial migration with all fields the system will e
 | `users` | name (PK), role, managed (bool, default true), target_apps (JSON list) |
 | `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
 | `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
-| `device_plugins` | (device, type, config JSON) — plugin types expected to govern this device, with per-instance config (e.g. the Windows local user account `windows-pc` should ACL) |
-| `core_plugins` | (type, instance_id, governs JSON list, config JSON) — in-core plugins. `governs` is a list of user names this instance covers, or `["*"]` for all governed users (e.g. `adguard` with `governs: ["*"]`) |
-| `plugin_instances` | name (PK, e.g. `windows-pc:gamingrig`), type, last_heartbeat, last_seen_version. Derived from `device_plugins` ∪ `core_plugins`: rows are created and deleted in the same transaction as the assignment row. Holds runtime state; the assignment tables hold desired state |
-| `plugin_tokens` | token_hash (PK), instance, created_at, revoked_at |
+| `device_agents` | (device PK, type, config JSON) — the agent type installed on this device (one per device), with config (e.g. which Windows local user account to ACL) |
+| `agent_instances` | device (PK, FK→devices), last_heartbeat, last_seen_version. Runtime state; one row per `device_agents` row, created and deleted in the same transaction |
+| `agent_tokens` | token_hash (PK), device, created_at, revoked_at — bearer per device, used by the agent on that device to authenticate |
+| `plugins` | (type, instance_id) PK; config JSON; governs JSON list (user names, or `["*"]` for all managed users); paused bool. In-core plugins discovered from `plugins_dir`; instance_id is empty by default and only set when multiple instances of the same type are needed |
 | `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
 | `audit_log` | id (PK), actor, action, target, payload (JSON), occurred_at |
-| `manifests` | type (PK), version, sha256, agent_url — versioned agent artifacts |
+| `manifests` | type (PK), version, sha256, agent_url — versioned **agent** artifacts (plugins are not distributed this way; they're files on disk) |
 | `settings` | Single-row table (id=1 enforced). Operator-tunable runtime knobs (tick rates, retention windows). Initial migration creates the row with defaults; feature migrations add columns. See `## Configuration and settings`. |
 
 ### Data model — concepts
@@ -127,25 +127,60 @@ Rules implement a single interface, declare their scope at registration, and ret
 
 Every additional lock condition (schedule, budget, shared-device, future per-device locks) is a new rule registered into the right scope's pipeline. No API surface changes, no central if/else to edit.
 
-## Plugin instance lifecycle
+## Two extension surfaces: agents and plugins
 
-A *plugin instance* is the runtime entity. Instances are declared by rows in the assignment tables:
+curfew has two ways to add enforcement, with different physics:
 
-- **Per-device plugins**: each `device_plugins(device, type)` row produces an instance named `<type>:<device>` (e.g. `windows-pc:gamingrig`).
-- **In-core plugins**: each `core_plugins(type, instance_id)` row produces an instance named `<type>` if singular, or `<type>:<instance_id>` if multiple (e.g. `adguard`, or `smart-plug:livingroom`).
+- **Agents** run **on a managed device** (Windows PC, Mac). They poll curfew-core because they can't be reached from the homelab (NAT, sleep, intermittent connectivity). One agent per device. Distributed via bootstrap install + versioned/hash-verified self-update.
+- **Plugins** run **inside curfew-core** as drop-in Python modules. They're called directly by the core when state changes (in-process function call, not HTTP). Distributed by dropping a folder into `plugins_dir`.
 
-Each plugin type registers a **capability descriptor** at core startup, declaring which device `os` and `type` values it applies to, which scopes it supports (`user`, `device`), and which config keys it requires. The descriptor lets the (future) GUI offer constrained dropdowns.
+Same goal — *given a user's lock state, make my surface reflect it* — but the mechanics differ.
 
-Lifecycle:
+## Agent lifecycle
 
-1. Operator adds the assignment row (`curfew plugin assign windows-pc gamingrig`). The core derives the instance name (`windows-pc:gamingrig`) and creates the matching `plugin_instances` row in the same transaction.
-2. Operator mints a per-instance bearer token (`curfew plugin token mint windows-pc:gamingrig`). Returns `{id, secret}`; the secret is shown once and never stored in plaintext, the id is what subsequent operations key on (revoke, list).
-3. For per-device plugins: operator runs the bootstrap one-liner on the device with the secret. The bootstrap fetches the agent via the versioned manifest (see below).
-4. Plugin heartbeats every tick (`POST /v1/plugins/{instance}/heartbeat`).
-5. Core compares expected instances (derived from the assignment tables) to actual heartbeats; surfaces drift on `GET /v1/plugins`.
-6. Removal: delete the assignment row → `plugin_instances` row deleted in the same transaction → core revokes outstanding tokens → next agent tick gets 401 → operator runs uninstall on the device.
+One agent per device. The agent code is `windows-pc-agent`, `macos-pc-agent`, etc. — an installable program that runs on the device and polls curfew-core.
 
-**Drift = unenforced.** A plugin that isn't heartbeating isn't enforcing. The database knows the user is locked; the device doesn't. Drift surfaces on `GET /v1/plugins` for the operator to investigate. Optional fail-closed agent behaviour (auto-lock on disconnect) is a feature on top — see "Auto-lock on disconnect."
+1. Operator installs the agent on a device (`curfew agent install windows-pc gamingrig --config '{"windows_user": "Kid1Local"}'`). This:
+   - Inserts a row in `device_agents`.
+   - Creates the matching `agent_instances` row in the same transaction.
+   - Mints a device-scoped bearer token (one row in `agent_tokens`); returns the secret once.
+   - Prints a bootstrap one-liner for the operator to run on the device.
+2. Operator runs the bootstrap on the device. It fetches the agent code via the versioned manifest (`GET /v1/agents/{type}/manifest`), verifies SHA-256, installs, registers a scheduled task / launchd / cron job.
+3. Agent heartbeats every tick (`POST /v1/devices/{device}/heartbeat`) carrying its last-known state hash. If the server's hash differs, the agent fetches `GET /v1/devices/{device}/state` and re-runs its reconciler. (See ADR-012.)
+4. Core surfaces drift on `GET /v1/agents` when an instance hasn't heartbeated within `drift_threshold_seconds`.
+5. Removal: `curfew agent uninstall gamingrig` → deletes the `device_agents` row → `agent_instances` cascade-deletes → outstanding tokens revoked → next agent tick gets 401 → operator removes the local install.
+
+**Drift = unenforced.** An agent that isn't heartbeating isn't enforcing. The database knows the user is locked; the device doesn't. Drift surfaces on `GET /v1/agents` for the operator to investigate. Optional fail-closed agent behaviour (auto-lock on disconnect) is a feature on top — see "Auto-lock on disconnect."
+
+## Plugin lifecycle
+
+Plugins are Python modules dropped into `plugins_dir` (default `/etc/curfew/plugins/`, mounted from a docker volume). Each subdirectory is one plugin type.
+
+```
+plugins/
+├── adguard/
+│   ├── manifest.toml      # type, name, version, config_schema, description
+│   ├── plugin.py          # subclasses Plugin, implements reconcile()
+│   └── requirements.txt   # optional pip deps
+├── smart_plug/
+│   ├── manifest.toml
+│   └── plugin.py
+└── wyze/                  # operator-authored
+    ├── manifest.toml
+    ├── plugin.py
+    └── requirements.txt
+```
+
+1. **Discovery** (at curfew-core startup): scan `plugins_dir`. For each subdirectory: read `manifest.toml`, optionally `pip install -r requirements.txt` into a per-plugin sub-environment, import `plugin.py`, find the class subclassing `Plugin`, register it under its `type` name.
+2. **Assignment** (operator): `curfew plugin assign adguard --config '{"url": "..."}' --governs '["*"]'`. Validates config against the plugin's Pydantic schema, inserts a row in `plugins`, instantiates the plugin in memory.
+3. **Reconciliation** (event-driven): when state changes for a user the plugin governs (lock toggled, schedule fired, etc.), curfew-core calls the plugin's `reconcile()` method directly. In-process function call; latency is microseconds.
+4. **Safety-net resync** (slow tick, default every 5 minutes): curfew-core walks all governed users and calls `reconcile()` on each registered plugin instance for each governed user. Catches missed events from restarts.
+5. **Pause / unpause**: `curfew plugin pause adguard` flips a `paused` flag. The core stops calling reconcile until unpaused; the instance stays loaded and config is preserved.
+6. **Removal**: `curfew plugin unassign adguard` deletes the row, drops the in-memory instance.
+
+Plugins don't heartbeat — they're in-process; their liveness is the core's. Plugins don't have tokens — there's no network boundary to authenticate. Adding new plugin code (a new directory in `plugins_dir`) requires a curfew-core restart to pick up; toggling existing plugins doesn't.
+
+See [PLUGINS.md](PLUGINS.md) for the plugin author's guide and [AGENTS.md](AGENTS.md) for the agent author's / operator's guide.
 
 ## Agent update integrity
 
@@ -158,77 +193,80 @@ Plugins running on devices fetch their agent code from the core. Updates are ver
 
 Future tightening (future feature, not the kernel): manifest signing with a long-lived key embedded in the bootstrap. The kernel design accommodates this without reshape.
 
-## Plugin SDK
+## SDKs
 
-The kernel ships a plugin SDK in two flavors:
+Two distinct SDKs because agents and plugins are different shapes:
 
-- **Python SDK** (`curfew_plugin_sdk_python`) — for in-core plugins and any per-device plugin running on Linux/macOS.
-- **PowerShell module** (`curfew-plugin-sdk-powershell`) — for windows-pc and any future Windows-resident plugin.
+### Agent SDK (for on-device agents)
+
+Polling-loop SDK with two flavors. An agent author writes a reconciler; the SDK runs the loop, the heartbeat, the manifest fetch, the hash verification, and the error reporting.
+
+- **`curfew_agent_sdk_python`** — for `macos-pc` and any future Linux/macOS agent.
+- **`curfew-agent-sdk-powershell`** — for `windows-pc` and any future Windows agent.
 
 Both expose:
 
 - Polling loop with tick rate driven by the heartbeat response
-- Heartbeat dispatch with retry/backoff and **hash-based change detection** (see below)
+- Device-level heartbeat dispatch with retry/backoff and **hash-based change detection** (per ADR-012)
 - Versioned + hash-verified self-update (per ADR-009)
 - Error reporting back to core (via heartbeat payload)
-- Config bootstrap (instance name, API URL, token)
+- Config bootstrap (device name, API URL, token)
 
-A plugin's business logic is the **reconciler** — given the lock status and per-instance config, do the right thing. The SDK handles everything else.
+**Hash-based change detection.** Each heartbeat carries the agent's last-known state hash; the server returns its current hash plus a small set of immediate-effect settings (`tick_seconds`, `drift_threshold_seconds`, etc.). Match → no work this tick. Mismatch → agent fetches `GET /v1/devices/{device}/state` (lock status, per-device config, target apps, relevant app catalog entries) and re-runs the reconciler. Heartbeats stay tiny; state pulls happen only when something actually changed.
 
-**Hash-based change detection (ADR-012).** Each heartbeat carries the agent's last-known *state hash*; the server returns its current hash plus a small set of immediate-effect settings (current `tick_seconds`, `drift_threshold_seconds`, etc.). If the hashes match, the agent has nothing new to do — it just records the heartbeat and waits for the next tick. If they differ, it fetches `GET /v1/plugins/{instance}/state` for the full picture (lock status, per-instance config, relevant target apps and app-catalog entries) and re-runs the reconciler. Heartbeats stay tiny; state pulls are rare — typically only when something actually changed.
+### Plugin SDK (for in-core plugins)
 
-The kernel also ships a **reference test plugin** — a no-op SDK consumer that heartbeats, observes lock-status changes, and writes a sentinel file when locked. The reference plugin lives in the test suite, exercises the SDK end-to-end, and is what the kernel acceptance test runs against. windows-pc is the first non-trivial SDK consumer (a feature on top of the kernel).
+Small Python helper. Not a polling loop — there's no loop, the core calls the plugin directly. Provides:
+
+- A `Plugin` base class with a `reconcile(scope)` method to override
+- Manifest validation helpers (`config_schema` resolution against Pydantic models)
+- Common types: `LockStatus`, `Reasons`, `ReconcileResult`
+- Optional helpers for HTTP clients with timeout/retry, since plugins almost always call out to some external service
+
+A plugin is a Python file. Importable shape:
+
+```python
+from curfew.plugin import Plugin, ReconcileResult
+from pydantic import BaseModel
+
+class Config(BaseModel):
+    url: str
+
+class AdGuardPlugin(Plugin):
+    def __init__(self, config: Config):
+        self.config = config
+
+    async def reconcile(self, scope) -> ReconcileResult:
+        if scope.locked:
+            await self._add_rules(scope.user, scope.target_apps)
+        else:
+            await self._clear_rules(scope.user)
+        return ReconcileResult.ok()
+```
+
+The plugin SDK is much smaller than the agent SDK because most of the agent SDK's work (polling, heartbeating, self-update) doesn't apply to in-process plugins.
+
+### Reference test consumers
+
+The kernel ships two no-op test consumers:
+
+- **`reftest-agent`** — exercises the agent SDK end-to-end (bootstrap, manifest fetch, heartbeat, state pull, reconcile).
+- **`reftest-plugin`** — exercises the plugin SDK end-to-end (discovery, instantiation, reconcile call).
+
+Both live in the test suite; they're what the kernel acceptance test runs against, so the kernel can be tested without depending on any feature-level agent or plugin.
 
 ### Which SDK each consumer uses
 
-| Plugin           | Where it runs    | SDK                            |
-|------------------|------------------|--------------------------------|
-| `windows-pc`     | Windows PC       | `curfew-plugin-sdk-powershell` |
-| `adguard`        | in-core (docker) | `curfew_plugin_sdk_python`     |
-| `smart-plug`     | in-core (docker) | `curfew_plugin_sdk_python`     |
-| `router-acl`     | in-core (docker) | `curfew_plugin_sdk_python`     |
-| `tailscale-acl`  | in-core (docker) | `curfew_plugin_sdk_python`     |
-| `macos-pc`       | macOS device     | `curfew_plugin_sdk_python`     |
-| `reftest` (test) | test harness     | `curfew_plugin_sdk_python`     |
-
-### Reconciler shape (illustrative)
-
-A plugin author writes only the reconciler. The SDK runs the polling loop, heartbeats, fetches the manifest, verifies the hash, and reports errors back to the core.
-
-Python (in-core or Linux/macOS):
-
-```python
-from curfew_plugin_sdk_python import Plugin
-
-class AdGuard(Plugin):
-    def reconcile(self, status):
-        if status.locked:
-            self.adguard_api.add_rules(self.user_blocklist)
-        else:
-            self.adguard_api.clear_rules()
-
-AdGuard().run()
-```
-
-PowerShell (Windows):
-
-```powershell
-Import-Module curfew-plugin-sdk-powershell
-
-Register-Reconciler -ScriptBlock {
-    param($status)
-    if ($status.locked) {
-        Apply-NTFSDeny -Paths $cfg.exe_paths
-        Stop-MatchingProcesses -Names $cfg.process_names
-    } else {
-        Remove-NTFSDeny -Paths $cfg.exe_paths
-    }
-}
-
-Start-CurfewPlugin
-```
-
-The exact SDK surface (class names, cmdlet names) is implementation detail of ADR-010 — what matters is that a plugin reduces to a reconciler.
+| Consumer | Kind | Where it runs | SDK |
+|---|---|---|---|
+| `windows-pc` | agent | Windows PC | `curfew-agent-sdk-powershell` |
+| `macos-pc` | agent | macOS device | `curfew_agent_sdk_python` |
+| `adguard` | plugin | in-core (curfew-core process) | plugin SDK |
+| `smart-plug` | plugin | in-core | plugin SDK |
+| `router-acl` | plugin | in-core | plugin SDK |
+| `tailscale-acl` | plugin | in-core | plugin SDK |
+| `reftest-agent` | agent (test) | test harness | `curfew_agent_sdk_python` |
+| `reftest-plugin` | plugin (test) | in-core | plugin SDK |
 
 ## Configuration and settings
 
@@ -256,6 +294,7 @@ What lives in config:
 | `CURFEW_ROOT_TOKEN` | operator bearer; env-only, never in `config.json` |
 | `CURFEW_LISTEN_HOST` / `CURFEW_LISTEN_PORT` | bind address for the FastAPI server |
 | `CURFEW_AGENT_BASE_URL` | public URL agents call back to (Traefik-fronted hostname) |
+| `CURFEW_PLUGINS_DIR` | directory scanned for in-core plugins at startup; default `/etc/curfew/plugins/` |
 | `CURFEW_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 | `CURFEW_CORS_ORIGINS` | allowed origins for the future GUI |
 
@@ -267,9 +306,10 @@ Single-row `settings` table with typed columns. The initial migration creates th
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `plugin_tick_seconds` | 60 | How often plugins poll lock status |
-| `manifest_tick_seconds` | 3600 | How often agents check for updates |
-| `drift_threshold_seconds` | 180 | A plugin counts as drifted after this long without a heartbeat |
+| `agent_tick_seconds` | 60 | How often agents poll the core (heartbeat + state-hash check) |
+| `manifest_tick_seconds` | 3600 | How often agents check for code updates |
+| `plugin_resync_seconds` | 300 | Safety-net resync interval — core walks all governed users and re-calls each plugin's reconcile |
+| `drift_threshold_seconds` | 180 | An agent counts as drifted after this long without a heartbeat |
 | `audit_retention_days` | 90 | Rolling window before audit rows are pruned |
 
 API: `GET /v1/settings` (read all), `PATCH /v1/settings` (update one or more). CLI: `curfew setting list | get | set`. Writes go through the audit log.
@@ -309,17 +349,23 @@ User / device / app CRUD
   PATCH  /v1/apps/{app}                         update
   DELETE /v1/apps/{app}                         delete
 
-Plugin lifecycle
-  GET    /v1/plugins                            expected instances + heartbeat status (drift)
-  GET    /v1/plugins/types                      registered types + capability descriptors
-  POST   /v1/plugins/assignments                body { type, target } where target is a device name or "core/{instance_id}"; returns { instance, ... } with derived name
-  DELETE /v1/plugins/assignments/{instance}     remove the assignment row
-  POST   /v1/plugins/{instance}/tokens          mint a bearer token; returns { id, secret } — secret shown once
-  DELETE /v1/plugins/{instance}/tokens/{id}     revoke
-  GET    /v1/plugins/{instance}/tokens          list active token ids (no secrets)
-  POST   /v1/plugins/{instance}/heartbeat       body { state_hash, agent_version }; returns { state_hash, tick_seconds, drift_threshold_seconds, ... } — agent compares hashes and pulls /state on mismatch
-  GET    /v1/plugins/{instance}/state           full state for this plugin: scoped lock status, per-instance config, governed users' target_apps, relevant app catalog entries
-  POST   /v1/plugins/{instance}/activity        body { user, occurred_at, ... }; no-op until budget rule registered
+Agents (per-device extension surface)
+  GET    /v1/agents                             list installed agents + heartbeat status (drift visible here)
+  POST   /v1/devices/{device}/agent             body { type, config }; installs an agent on this device, mints a bearer, returns { token: { id, secret }, bootstrap }
+  DELETE /v1/devices/{device}/agent             uninstall the agent (deletes device_agents + agent_instances rows, revokes tokens)
+  POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version }; returns { state_hash, tick_seconds, drift_threshold_seconds, ... }
+  GET    /v1/devices/{device}/state             full state for this device's agent: scoped lock status, agent config, target apps, relevant app catalog entries
+  POST   /v1/devices/{device}/activity          body { user, occurred_at, ... }; no-op until budget rule registered
+  POST   /v1/devices/{device}/tokens            mint an additional bearer for this device; returns { id, secret }
+  GET    /v1/devices/{device}/tokens            list active token ids (no secrets)
+  DELETE /v1/devices/{device}/tokens/{id}       revoke
+
+Plugins (in-core extension surface)
+  GET    /v1/plugins                            list assigned plugin instances + paused/governs/config
+  GET    /v1/plugins/types                      list discovered plugin types from plugins_dir + their config_schema
+  POST   /v1/plugins                            body { type, instance_id?, config, governs }; assigns a plugin
+  PATCH  /v1/plugins/{type}                     update config / governs / paused (use {type}:{instance_id} when not the default)
+  DELETE /v1/plugins/{type}                     unassign
 
 Locks
   POST   /v1/users/{user}/lock                  manual lock
@@ -329,9 +375,9 @@ Lock status
   GET    /v1/users/{user}/status                { locked: bool, reasons: [{kind, ...}] }
   GET    /v1/devices/{device}/status            { locked: bool, reasons: [{kind, ...}] } — empty pipeline in kernel
 
-Agent updates
-  GET    /v1/agents/{type}/manifest             { version, sha256, url }
-  GET    /v1/agents/{type}/{version}            agent artifact (the agent.ps1 / .py / .sh)
+Agent code distribution
+  GET    /v1/agents/{type}/manifest             { version, sha256, url } — what the bootstrap fetches
+  GET    /v1/agents/{type}/{version}            agent artifact (the .ps1 / .py / .sh package)
   POST   /v1/agents/{type}/versions             publish a new agent version: body { version, artifact }; rotates the manifest pointer to it
 
 Settings
@@ -346,16 +392,20 @@ Admin
 ## CLI shape (kernel)
 
 ```
-curfew user        add | list | show | edit | rm
-curfew device      add | list | show | edit | rm
-curfew app         add | list | show | edit | rm
-curfew plugin      assign | unassign | types | list | drift
-curfew plugin token  mint | revoke | list
-curfew agent       publish <type> <version> <file>
-curfew setting     list | get | set
-curfew lock        <user>
-curfew unlock      <user>
-curfew status                                # human-readable summary
+curfew user             add | list | show | edit | rm
+curfew device           add | list | show | edit | rm
+curfew app              add | list | show | edit | rm
+
+curfew agent            install <type> <device> | uninstall <device> | list | drift
+curfew agent token      mint <device> | list <device> | revoke <device> <id>
+curfew agent publish    <type> <version> <file>             # publish a new version of agent code
+
+curfew plugin           assign <type> | unassign <type> | pause <type> | unpause <type> | list | types
+
+curfew setting          list | get | set
+curfew lock             <user>
+curfew unlock           <user>
+curfew status                                                # human-readable summary
 
 # Convention: every list/show/status command accepts --json for machine-readable output.
 ```
@@ -365,32 +415,48 @@ curfew status                                # human-readable summary
 ```
 curfew/
 ├── src/
-│   ├── curfew/                       # shared library — models, schemas, rule interface, plugin contract
-│   ├── curfew_api/                   # FastAPI service
-│   │   └── migrations/               # Alembic
-│   ├── curfew_cli/                   # CLI — thin HTTP client
-│   ├── curfew_plugin_sdk_python/     # Python plugin SDK
-│   └── curfew-plugin-sdk-powershell/ # PowerShell plugin SDK module
-├── plugins/
-│   └── windows-pc/
-│       ├── agent.ps1                 # the per-tick agent (uses the PowerShell SDK)
-│       ├── install-agent.ps1         # bootstrap installer
-│       └── tests/                    # Pester tests
+│   ├── curfew/                        # shared library — models, schemas, rule interface, Plugin base class
+│   ├── curfew_api/                    # FastAPI service
+│   │   └── migrations/                # Alembic
+│   ├── curfew_cli/                    # CLI — thin HTTP client
+│   ├── curfew_agent_sdk_python/       # Python agent SDK (polling, heartbeat, self-update)
+│   └── curfew-agent-sdk-powershell/   # PowerShell agent SDK module (parallel, for Windows)
+├── agents/
+│   ├── windows-pc/
+│   │   ├── agent.ps1                  # uses the PowerShell agent SDK
+│   │   ├── install-agent.ps1          # bootstrap installer
+│   │   └── tests/                     # Pester tests
+│   └── macos-pc/
+│       ├── agent.py                   # uses the Python agent SDK
+│       ├── install-agent.sh           # bootstrap installer
+│       └── tests/
+├── plugins/                           # in-core plugins — shipped with curfew
+│   ├── adguard/
+│   │   ├── manifest.toml
+│   │   ├── plugin.py
+│   │   └── requirements.txt
+│   ├── smart_plug/
+│   │   ├── manifest.toml
+│   │   └── plugin.py
+│   └── ...                            # router-acl, tailscale-acl, etc.
 ├── tests/
-│   ├── unit/                         # models, schemas, rule pipeline, SDK
-│   ├── api/                          # FastAPI TestClient integration tests
-│   ├── cli/                          # CLI against a mocked or real API
-│   ├── reftest/                      # reference test plugin (Python SDK consumer)
-│   └── e2e/                          # docker-compose-up + CLI roundtrip + reftest
+│   ├── unit/                          # models, schemas, rule pipeline, SDKs
+│   ├── api/                           # FastAPI TestClient integration tests
+│   ├── cli/                           # CLI against a mocked or real API
+│   ├── reftest_agent/                 # reference test agent (Python agent SDK consumer)
+│   ├── reftest_plugin/                # reference test plugin (Python plugin in plugins_dir form)
+│   └── e2e/                           # docker-compose-up + CLI roundtrip + both reftests
 ├── docker/
 │   ├── Dockerfile
 │   └── compose.yml
 ├── docs/
 │   ├── PLAN.md
-│   └── DECISIONS.md
+│   ├── DECISIONS.md
+│   ├── AGENTS.md                      # how to author and operate agents
+│   └── PLUGINS.md                     # how to author and operate plugins
 ├── .github/workflows/
-│   ├── ci.yml                        # ruff + mypy + pytest (Linux)
-│   └── windows.yml                   # Pester (Windows runner)
+│   ├── ci.yml                         # ruff + mypy + pytest (Linux)
+│   └── windows.yml                    # Pester (Windows runner)
 ├── pyproject.toml
 └── README.md
 ```
@@ -402,39 +468,54 @@ curfew/
 | Schema models | pytest + in-memory SQLite | CRUD round-trips, schema validation, migrations apply forward, FK/uniqueness behaviour. ≥90% coverage. |
 | Config loading | pytest | Precedence (env > .env > config.json > defaults); bad values refuse to boot; secrets never read from `config.json`. |
 | Rule pipeline | pytest | Rule registration, OR composition, reasons aggregation, behaviour with zero rules. |
-| Plugin contract | pytest with a fake plugin | Reference test plugin exercises the full contract; serves as living documentation. |
-| Plugin SDK (Python) | pytest | Polling loop, heartbeat retry, state-hash change detection (matching → no-op; mismatch → pull `/state`), manifest fetch, hash mismatch refusal. |
-| Plugin SDK (PowerShell) | Pester | Same coverage, on the Windows runner. |
+| Agent contract | pytest with reftest_agent | Reference test agent exercises the full agent contract end-to-end; living documentation. |
+| Plugin contract | pytest with reftest_plugin | Reference test plugin exercises the discover-instantiate-reconcile flow; living documentation. |
+| Agent SDK (Python) | pytest | Polling loop, heartbeat retry, state-hash change detection (matching → no-op; mismatch → pull `/state`), manifest fetch, hash mismatch refusal. |
+| Agent SDK (PowerShell) | Pester | Same coverage, on the Windows runner. |
+| Plugin SDK | pytest | Plugin discovery from `plugins_dir`, manifest validation, config schema enforcement, reconcile error containment. |
 | API | pytest + FastAPI TestClient | Every endpoint: happy path, auth failures, validation errors, idempotency. |
 | Agent update flow | pytest + Pester | Manifest endpoint, hash verification, atomic swap, rollback on failed swap. |
 | CLI | pytest + httpx mocking | Each command, exit codes, output formatting. |
 | Audit log | pytest | Every API write produces a row; payloads are structured. |
-| End-to-end | pytest + docker compose | Spin up the stack, run CLI, observe plugin instance heartbeat + drift. |
+| End-to-end | pytest + docker compose | Spin up the stack, run CLI, observe an agent heartbeat + drift, observe a plugin reconcile being called on lock. |
 
 CI runs on every push:
 - **Linux runner**: ruff + mypy + pytest (unit, API, CLI, e2e with docker compose).
-- **Windows runner**: Pester for the PowerShell SDK + windows-pc agent + installer smoke test.
+- **Windows runner**: Pester for the PowerShell agent SDK + windows-pc agent + installer smoke test.
 
 Pre-commit hooks for lint/format. Type hints required (`mypy --strict` for the core).
 
 ## Acceptance: kernel done
 
-The kernel is "done" when this end-to-end walkthrough passes against the **reference test plugin** (a no-op SDK consumer in the test suite that heartbeats, observes lock-status changes, and writes a sentinel file when locked). The reference plugin exercises the kernel end-to-end without depending on any feature-level plugin.
+The kernel is "done" when both extension surfaces work end-to-end. Two reference test consumers live in the test suite — `reftest_agent` (a no-op agent SDK consumer that writes a sentinel file when locked) and `reftest_plugin` (a no-op in-core plugin that writes a different sentinel file when its `reconcile` is called) — and the kernel acceptance exercises both.
 
-1. CLI creates a user (`curfew user add kid1 --role member`), a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`), and an app (`curfew app add steam --exe-path ...`).
-2. CLI publishes the reference plugin's first version (`curfew agent publish reftest 1.0.0 ./reftest.py`).
-3. CLI assigns the reference plugin to the device (`curfew plugin assign reftest gamingrig`); verify the `plugin_instances` row was created in the same transaction.
-4. CLI mints a token (`curfew plugin token mint reftest:gamingrig`); CLI prints the secret once and the bootstrap one-liner.
-5. The reference plugin runs the bootstrap. The bootstrap fetches the manifest, verifies SHA-256, installs the plugin.
-6. Plugin heartbeats; `GET /v1/plugins` shows it healthy.
-7. Stop the plugin; `GET /v1/plugins` shows drift within 2 ticks.
-8. CLI locks the user (`curfew lock kid1`); the manual_lock rule fires; `GET /v1/users/kid1/status` returns `{locked: true, reasons: [{kind: "manual_lock"}]}`.
-9. The reference plugin reads the lock status and writes its sentinel file.
-10. CLI unlocks; the reference plugin clears its sentinel.
-11. CLI removes the assignment (`curfew plugin unassign reftest:gamingrig`); the `plugin_instances` row is deleted, outstanding tokens are revoked, the next heartbeat gets 401.
-12. `audit_log` contains a structured row for every API write in the sequence.
+**Agent path:**
 
-windows-pc lands as the first real feature immediately after the kernel passes — same lifecycle, but with NTFS ACLs and process kill replacing the sentinel file.
+1. CLI creates a user (`curfew user add kid1 --role member`) and a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`).
+2. CLI publishes the reference agent's first version (`curfew agent publish reftest 1.0.0 ./reftest_agent.tar`).
+3. CLI installs the reference agent (`curfew agent install reftest gamingrig --config '{}'`); verify the `device_agents` and `agent_instances` rows are created in the same transaction; CLI prints the secret once and the bootstrap one-liner.
+4. The reference agent runs the bootstrap. It fetches the manifest, verifies SHA-256, installs.
+5. Agent heartbeats; `GET /v1/agents` shows it healthy.
+6. Stop the agent; `GET /v1/agents` shows drift within 2 ticks.
+7. CLI locks the user (`curfew lock kid1`); the manual_lock rule fires; `GET /v1/users/kid1/status` returns `{locked: true, reasons: [{kind: "manual_lock"}]}`.
+8. State-hash mismatch on next heartbeat → agent pulls `/state` → reads lock status → writes its sentinel file.
+9. CLI unlocks; agent clears its sentinel.
+10. CLI removes the agent (`curfew agent uninstall gamingrig`); rows are deleted, outstanding tokens revoked, next heartbeat returns 401.
+
+**Plugin path:**
+
+11. Drop `reftest_plugin/` into `plugins_dir`; restart curfew-core. `GET /v1/plugins/types` lists `reftest_plugin` as discovered.
+12. CLI assigns the plugin (`curfew plugin assign reftest_plugin --config '{}' --governs '["kid1"]'`).
+13. CLI locks `kid1` again; the core directly calls `reftest_plugin.reconcile()` (in-process); the plugin writes its sentinel.
+14. CLI unlocks; reconcile is called again; the plugin clears its sentinel.
+15. CLI pauses the plugin (`curfew plugin pause reftest_plugin`); subsequent state changes do not trigger reconcile.
+16. CLI unassigns; the in-memory instance is dropped.
+
+**Cross-cutting:**
+
+17. `audit_log` contains a structured row for every API write in the entire sequence.
+
+windows-pc and adguard land as the first real feature implementations of each surface, immediately after the kernel passes.
 
 ---
 
@@ -456,7 +537,7 @@ Tests: expression parsing, time-zone handling, transitions across midnight/DST, 
 
 ## Budget lock rule + activity ingestion
 
-Adds `usage_minutes(user, day, minutes)` table via Alembic migration. Plugins call `POST /v1/plugins/{instance}/activity` with `{user, occurred_at}` when they observe recent user input — the kernel endpoint that was a no-op now writes to `usage_minutes`. A new user-scope rule returns `{kind: "budget_exhausted", consumed: 120, budget: 90}` when the user's recurring budget is consumed for the period. Resets daily/weekly. CLI: `curfew budget <user> <minutes>`.
+Adds `usage_minutes(user, day, minutes)` table via Alembic migration. Agents call `POST /v1/devices/{device}/activity` with `{user, occurred_at}` when they observe recent user input — the kernel endpoint that was a no-op now writes to `usage_minutes`. A new user-scope rule returns `{kind: "budget_exhausted", consumed: 120, budget: 90}` when the user's recurring budget is consumed for the period. Resets daily/weekly. CLI: `curfew budget <user> <minutes>`.
 
 **Today-only bonus.** Operator can grant extra minutes for a single day (e.g. "give kid1 30 more minutes today") without changing the recurring budget. Likely a `budget_overrides(user, date, extra_minutes)` table; the rule adds the override to the recurring allowance when computing remaining minutes for that day, and the override expires when the day passes. CLI: `curfew budget <user> --today +30`.
 
@@ -468,31 +549,44 @@ A new **device-scope rule** — the first to register into the device-scope pipe
 
 Adds a `device_app_overrides(device, app, exe_paths, process_names, urls)` table. Resolution path in the core: when a plugin reads the lock status for a device, the global app entry is overridden by the device's row if present. **Replace** semantics — override list replaces global list, not merge.
 
-## Plugins
+## Agents
 
-Each plugin is a new type with: a capability descriptor, an SDK consumer (Python or PowerShell), and a bootstrap one-liner if per-device. Implementations:
+On-device agent implementations. Each is a new agent type — a published agent artifact + a bootstrap installer. The agent SDK handles polling, heartbeating, and self-update; the agent author writes the reconciler.
 
-- **`windows-pc`** (per-device, `curfew-plugin-sdk-powershell`) — first plugin; stress-tests the SDK and shapes the contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
-- **`adguard`** (in-core, `curfew_plugin_sdk_python`) — first in-core plugin; stress-tests the in-core path. DNS sinkhole via AdGuard Home REST API.
-- **`smart-plug`** (in-core, `curfew_plugin_sdk_python`) — Tasmota/Kasa power control.
-- **`router-acl`** (in-core, `curfew_plugin_sdk_python`) — UniFi/OPNsense API.
-- **`tailscale-acl`** (in-core, `curfew_plugin_sdk_python`) — gate egress for managed devices on the tailnet.
-- **`macos-pc`** (per-device on macOS, `curfew_plugin_sdk_python`) — same primitives translated.
+- **`windows-pc`** (`curfew-agent-sdk-powershell`) — first agent; stress-tests the agent contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
+- **`macos-pc`** (`curfew_agent_sdk_python`) — same primitives translated for macOS.
+
+Future: `linux-pc`, embedded-device agents, etc.
+
+## Plugins (in-core implementations)
+
+Drop-in Python plugins shipped with curfew (in `plugins/` in the repo) and discovered at startup via `plugins_dir`. Each is a folder with `manifest.toml` + `plugin.py`. Operator-authored third-party plugins live alongside these — same shape, different origin.
+
+- **`adguard`** — first in-core plugin; stress-tests plugin discovery + the resync path. DNS sinkhole via AdGuard Home REST API.
+- **`smart-plug`** — Tasmota/Kasa power control.
+- **`router-acl`** — UniFi/OPNsense API.
+- **`tailscale-acl`** — gate egress for managed devices on the tailnet.
+
+See [PLUGINS.md](PLUGINS.md) for how to author a new plugin.
 
 ## Auto-lock on disconnect (fail-closed agents)
 
 Adds a `failclosed_after_seconds` setting (default `0` = disabled). When non-zero, any agent that hasn't successfully fetched state for that many seconds invokes its reconciler with `{locked: true, reasons: [{kind: "failclosed", since: ...}]}` regardless of last-known state. Closes the gap between "locked in the database" and "enforced on the device" while the agent is offline.
 
-Implementation lives in the SDK — both Python and PowerShell flavours track time-since-last-successful-fetch and trip the fail-closed reconciler when they cross the threshold. Per-instance opt-out or per-instance threshold override (via `device_plugins.config`) is a future tightening; the kernel ships a single global setting.
+Implementation lives in the agent SDK — both Python and PowerShell flavours track time-since-last-successful-fetch and trip the fail-closed reconciler when they cross the threshold. Per-device opt-out or per-device threshold override (via `device_agents.config`) is a future tightening; the kernel ships a single global setting.
+
+(Plugins don't need this — they're in-process; "disconnect" is meaningless for them.)
 
 ## Drift notifications
 
-Operator alerting when a plugin instance is drifted past `drift_threshold_seconds`. Two implementation options, neither committed:
+Operator alerting when an agent is drifted past `drift_threshold_seconds`. Two implementation options, neither committed:
 
-- **Outbound webhook** — `drift_webhook_url` setting; the core POSTs a small payload when an instance drifts. Operator pipes into Slack / email / whatever.
-- **Polled query** — `GET /v1/plugins?drifted=true` is enough for an external cron to ping the operator.
+- **Outbound webhook** — `drift_webhook_url` setting; the core POSTs a small payload when an agent drifts. Operator pipes into Slack / email / whatever.
+- **Polled query** — `GET /v1/agents?drifted=true` is enough for an external cron to ping the operator.
 
-Until either lands, the operator monitors `GET /v1/plugins` manually. Auto-lock on disconnect (above) is the primary mitigation; notifications are the secondary signal so the operator knows enforcement has switched to fail-closed mode.
+Until either lands, the operator monitors `GET /v1/agents` manually. Auto-lock on disconnect (above) is the primary mitigation; notifications are the secondary signal so the operator knows enforcement has switched to fail-closed mode.
+
+(Plugins are in-process; if they crash, curfew-core itself is having a bad time and the homelab orchestrator notices that the container is unhealthy.)
 
 ## GUI
 
@@ -516,7 +610,7 @@ Almost certainly never needed. Pull-based at 60s tick is fine for screentime for
 
 Implementation-level decisions still pending — none are kernel-architectural:
 
-1. **Plugin agent language for `windows-pc`** — pure PowerShell (zero deps on Windows) or bundled Python (cleaner state logic, requires runtime install)? *Lean: PowerShell for managed PCs to stay dependency-free.*
+1. **Agent language for `windows-pc`** — pure PowerShell (zero deps on Windows) or bundled Python (cleaner state logic, requires runtime install)? *Lean: PowerShell for managed PCs to stay dependency-free.*
 2. **Mid-session lock behaviour** — kill running processes immediately, force logoff, or just block future launches? *Lean: kill matching processes (with a config knob to opt out).*
 3. **Initial app list** — Steam, Minecraft, YouTube definite; decide on Roblox, Discord, Twitch.
 4. **CI runners** — public GitHub Actions (free Windows runner) vs. self-hosted on the homelab? *Lean: GitHub Actions until private code or speed becomes an issue.*
@@ -525,7 +619,7 @@ Implementation-level decisions still pending — none are kernel-architectural:
 
 ## Non-goals (for now)
 
-- macOS, Linux, or non-Windows PC enforcement (will come as plugins; not the first plugin).
+- macOS, Linux, or non-Windows PC enforcement (will come as agents; not the first agent).
 - Cloud-account integration (Microsoft Family Safety, Google Family Link).
 - Tamper-resistance against a managed user with OS-level admin privileges on their device (assumes managed users run as standard local users).
 - Real-time push (long-polling / SSE) — listed as a feature for completeness but no expected need.
