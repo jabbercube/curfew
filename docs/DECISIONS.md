@@ -2,116 +2,124 @@
 
 Short notes on the major design decisions and rejected alternatives. Captures the *why* so we don't relitigate later.
 
-## ADR-001: API-first hosted core (rejected: library-first / no-daemon)
+## ADR-001: API-first hosted core
 
-**Decided:** run a small FastAPI service in a docker container as the system of record. CLI is a thin HTTP client. Future GUI is another HTTP client.
+**Decided:** run a small FastAPI service in a docker container as the system of record. CLI is a thin HTTP client; future GUI is another HTTP client; plugins are HTTP clients too.
 
-**Rejected:** pure-library design where the CLI imports `curfew` functions directly and writes state to a JSON file on disk. No daemon ever required. Frontends share the library.
-
-**Why API-first won:**
-- A web GUI accessible from a phone is a stated long-term goal. Phone access *requires* a server. Bolting one on later means refactoring file-locking and ad-hoc state mutation out of the CLI.
-- Multiple concurrent writers (CLI + future GUI + scheduler) on a JSON file means rolling our own locking — easy to get wrong. A daemon serializes writes naturally.
-- Heartbeats, budgets, audit logs (V3+) all need persistent compute beyond a static file.
-- Docker is already the homelab pattern. One more small compose stack is genuinely cheap operational cost.
-- Push (long-polling / SSE), if/when added, requires *something* running. The library-only path can never have it.
-
-**Library-first remains the right call** if the project ever scopes back to terminal-only / desktop-only GUI with no phone access. Not currently the plan.
-
-## ADR-002: Pull-based plugin reconciliation (push deferred)
-
-**Decided:** plugins poll the API on a timer (default 60s) and reconcile their slice of state. Push (long-polling / SSE) deferred to V5+ as a pure addition.
+**Rejected:** pure-library design (CLI imports core functions directly, writes to a file on disk).
 
 **Why:**
-- Self-heals through reboots, sleep, and network changes. Kid PCs are unreliable; a push-first design fails silently when the host is unreachable at command time.
-- Push is purely additive once the contract is "poll + reconcile" — push just makes plugins poll sooner; same code path runs.
-- Within-the-tick latency (≤60s) is acceptable for screentime. Sub-second response isn't needed.
 
-## ADR-003: Per-device plugins distributed via bootstrap script
+- A web GUI accessible from a phone is a stated long-term goal. Phone access requires a server.
+- Multiple concurrent writers (CLI + GUI + plugins heartbeating) need a daemon to serialize. Library + file on disk means rolling our own locking — easy to get wrong.
+- Future features (heartbeats, budgets, audit log, push) all need persistent compute beyond a static file.
+- Docker is already the homelab pattern; one more compose stack is genuinely cheap operational cost.
 
-**Decided:** plugins that need OS-level access (`windows-pc`, future `macos-pc`) install via a one-line PowerShell/shell bootstrap that drops the agent + registers a scheduled task. The agent self-updates from the core thereafter.
+Library-first remains the right call only if the project ever scopes back to terminal-only with no remote access. Not the plan.
+
+## ADR-002: SQLite is the only persistent store
+
+**Decided:** all persistent data — inventory, runtime state, tokens, audit log, agent manifests — lives in a single `state.sqlite` file. SQLModel for the schema, Alembic for migrations from day one.
 
 **Rejected:**
-- MSI / proper installer — overkill for a homelab with a handful of PCs.
-- Group Policy / Intune / MDM — requires AD or cloud MDM the homelab doesn't run.
-- Manual copy + manual scheduled task setup — fine for one PC, doesn't scale.
 
-**Why bootstrap won:** zero new infrastructure (the bootstrap and agent files live behind the same Traefik that serves the API), one-time per device, self-healing updates, idiomatic for the scale.
+- **Multi-store split (e.g. YAML inventory + SQLite runtime).** Felt natural early on — inventory is human-edited, runtime is machine-written, different lifecycles. Breaks down the moment a CLI or GUI tries to write inventory: YAML round-tripping that preserves comments and ordering is fragile, and bidirectional sync between YAML and a runtime store is famously hard. Cleaner to put everything in SQLite and offer YAML as an *optional client-side import tool* if anyone wants it (just another HTTP client of the inventory CRUD endpoints).
+- **Postgres.** Overkill for a homelab single-tenant store. Adds an operational dependency.
+- **JSON file.** Concurrency-unsafe with multiple writers. Schema-less, so every change is a custom migration loader.
 
-## ADR-004: Plugin contract is "poll state, reconcile, heartbeat"
+**Why SQLite is enough:**
 
-**Decided:** minimal interface. A plugin authenticates with a bearer token, calls `GET /v1/state/effective/{user}` (or filtered variant) on a timer, reconciles its domain to match, and `POST`s a heartbeat each tick so the core can detect drift between the inventory's expected instances and what's actually checking in (see ADR-008).
+- WAL mode handles concurrent readers + a writer cleanly.
+- Backups are `cp` of one file (or `.backup` for atomic).
+- Inspection is `sqlite3 state.sqlite '.dump'` or any GUI.
+- SQLModel gives Pydantic-compatible models with `create_all()`; Alembic versions migrations from day one so feature additions are additive, not panicked ports.
+
+## ADR-003: Pull-based plugin reconciliation
+
+**Decided:** plugins poll the API on a timer (default 60s) and reconcile their slice of state. Push (long-polling / SSE) is not planned.
+
+**Why:**
+
+- Self-heals through reboots, sleep, and network changes. Push-first fails silently when a host is unreachable at command time.
+- Within-the-tick latency (≤60s) is acceptable for screentime. Sub-second response isn't needed.
+- Push remains additive if ever required: it's just a way to make plugins poll sooner; the reconcile path doesn't change.
+
+## ADR-004: Per-device plugins distributed via bootstrap script
+
+**Decided:** plugins that need OS-level access (`windows-pc`, future `macos-pc`) install via a one-line shell/PowerShell bootstrap that drops the agent + registers a scheduled task / launchd / cron job. The agent self-updates from the core via versioned manifests (ADR-009).
+
+**Rejected:**
+
+- **MSI / proper installer** — overkill for a homelab with a handful of PCs.
+- **Group Policy / Intune / MDM** — requires AD or cloud MDM the homelab doesn't run.
+- **Manual copy + manual scheduled task setup** — fine for one PC, doesn't scale.
+
+**Why bootstrap won:** zero new infrastructure (the bootstrap and agent live behind the same Traefik that serves the API), one-time per device, idiomatic for the scale, self-healing updates via ADR-009.
+
+## ADR-005: Plugin contract — poll, reconcile, heartbeat
+
+**Decided:** a plugin authenticates with a per-instance bearer (ADR-006), reads its scoped state (`GET /v1/state/effective/{user}` or filtered variants), reconciles its slice of the world to match, and `POST`s a heartbeat each tick. Optionally `POST`s an activity ping when there's recent user input (consumed by the budget feature when registered).
 
 **Why minimal:**
-- Lets in-core plugins (AdGuard, smart-plug) and per-device plugins (windows-pc) share the same contract. Deployment differs; the contract doesn't.
-- New plugin = new poller + new reconcile logic. Nothing in the core changes.
-- Schedule and budget evaluation live in the *core*, not in plugins, so plugins stay dumb. Plugins see only `effective_lock: bool`.
 
-## ADR-005: SQLite for runtime state from V1
+- Lets in-core plugins (`adguard`, `smart-plug`) and per-device plugins (`windows-pc`) share the same contract — deployment differs, contract doesn't.
+- New plugin = new SDK consumer + reconcile logic. Nothing in the core changes.
+- Schedule and budget evaluation live in the *core* as rules (ADR-008), not in plugins. Plugins stay dumb — they see only `effective_lock: bool` and a `reasons` list, no understanding of why.
 
-**Decided:** V1 stores runtime state (user locks, plugin heartbeats, future budgets and audit log) in `state.sqlite`, with SQLModel for the schema and Alembic for migrations from day one.
+## ADR-006: Per-instance bearer tokens
 
-**Rejected:** single JSON file written atomically by the API. Simpler at first glance, but:
+**Decided:** each plugin instance gets its own bearer token. A second `windows-pc:laptop2` would have a separate token from `windows-pc:gamingrig`. Tokens are hashed at rest in the `plugin_tokens` table.
 
-- The API has multiple writers in V1 already — the CLI calling lock/unlock plus plugins heartbeating on a 60s tick. JSON-on-disk needs file locking (fcntl), easy to get wrong across Docker volume mounts. SQLite WAL mode handles this for free.
-- The "migrate from JSON later" path is a one-way door under deadline pressure — the JSON-to-relational reshape would happen during V3 (budgets), competing with the feature work that motivated the move. Starting in SQLite means V3 just adds tables.
-- After the first 2–3 schema changes, writing custom upgrade-on-load functions for JSON is more work than versioned Alembic migrations, not less.
-- The original "JSON is human-readable" appeal is eliminated by ADR-007 — human-edited inventory now lives in `inventory.yaml`. Runtime state is API-written only and gains nothing from being a text file.
+**Why:** revoke a single compromised PC without nuking the rest; log which instance made which call.
 
-**Why this is still simple enough:** SQLModel gives Pydantic-style models with `create_all()`. The V1 schema is three small tables. Backups are `cp` of a single file. Inspection is `sqlite3 state.sqlite '.dump'` or any GUI.
+**Read-scope tightening** — making a `windows-pc:gamingrig` token only able to read `kid1`'s slice of state, not all state — is a future feature on top of the kernel. Issuance is per-instance from day one; scoping is later.
 
-## ADR-006: Per-instance bearer tokens from day one
+## ADR-007: Inventory declares expected plugin instances
 
-**Decided:** each plugin instance gets its own bearer token. A second `windows-pc:laptop2` would have a separate token from `windows-pc:gamingrig`. V1 has only one instance so this is invisible at first, but the issuance model is per-instance from day one.
-
-**Why:** small upfront cost (one extra row in the `plugin_tokens` table), big audit/security win later. Per-instance tokens let us revoke a single compromised PC without nuking the rest, and we can log which instance made which call.
-
-**What's deferred:** per-instance *read-scope* limits — a `windows-pc:gamingrig` token can currently read all state, not just kid1's slice. Tightening this is on the V5+ list. Issuance is per-instance now; scoping is later.
-
-## ADR-007: Inventory and runtime state are separate stores
-
-**Decided:** persistent data is split across two stores with different lifecycles:
-
-- **`inventory.yaml`** — users (with `role`), devices (with `owner`, `mac`, expected `plugins`), and the global `apps` catalog. Human-edited (or rewritten by a CLI command). Loaded on startup; reloaded via `POST /v1/admin/reload-inventory`. Validated against a Pydantic schema; bad YAML refuses to load and the previous good copy stays in memory.
-- **`state.sqlite`** — runtime state written by the API on every command and every plugin tick: locks, heartbeats, last-seen, future budget tally and audit log.
-
-**Rejected:** single combined store (JSON or SQLite) holding both inventory and runtime state.
-
-**Why split:**
-- Inventory and runtime state have fundamentally different lifecycles. Inventory changes when a kid gets a new PC (weekly at most); runtime state changes on every CLI command and every plugin tick (every 60s). Mixing them means every state write rewrites or touches data that didn't change.
-- Inventory benefits from being human-editable and version-controlled. YAML beats SQLite for `vim` access and beats JSON for comments and multiline strings.
-- Runtime state benefits from concurrency-safe writes and indexed queries (per ADR-005). Inventory does not — it's loaded once and held in memory.
-- Backups have different cadences. `inventory.yaml` lives in a config dir (or git); `state.sqlite` lives in a docker volume backed up like other runtime data.
-- Recovery: corruption of `state.sqlite` is recoverable from heartbeats + plugin reconciliation. Corruption of `inventory.yaml` is a real problem, but the file is tiny and version-controlled.
-
-**Why YAML over TOML/JSON for inventory:** comments (essential for explaining MAC entries, plugin choices), multiline strings, clean nested lists. Loaded once at startup, so format performance is irrelevant.
-
-## ADR-008: Plugin assignment is inventory-as-desired-state
-
-**Decided:** the inventory file declares which plugin instances *should* exist; plugin heartbeats record what *actually* checked in; the core compares the two and surfaces drift on `GET /v1/plugins`.
-
-Concretely, in V1:
-
-- Each `devices.{name}.plugins` entry in `inventory.yaml` produces one expected plugin instance (e.g. `windows-pc:gamingrig`). In-core plugin types like `adguard` are configured separately and produce their own expected instances.
-- Plugins authenticate with a per-instance bearer (per ADR-006) and call `POST /v1/plugins/{name}/heartbeat` on every tick. The core records `last_heartbeat` and `last_seen_version`.
-- `GET /v1/plugins` lists expected instances (from inventory) joined with actual heartbeats. Stale or missing heartbeats are visible there as drift.
+**Decided:** the inventory tables (`device_plugins` for per-device, `core_plugins` for in-core) are the source of truth for which plugin instances *should* exist. Plugin heartbeats record what *actually* checked in. The core compares the two and surfaces drift on `GET /v1/plugins`.
 
 **Rejected:**
 
-- **Pure plugin-driven** (plugin announces itself on first heartbeat, inventory has no plugin assignment). Loses the ability to distinguish "agent broken" from "agent uninstalled" — both look like silence.
-- **Pure inventory-driven** (inventory declares assignment, no heartbeats). Loses liveness signal.
+- **Pure plugin-driven** (plugin announces itself on first heartbeat; inventory has no plugin assignment). Loses the ability to distinguish "agent broken" from "agent uninstalled" — both look like silence.
+- **Pure inventory-driven** (declared in inventory, no heartbeats). Loses liveness signal entirely.
 
-**End-state model (target for later phases, not all in V1):**
+**Symmetric for in-core and per-device plugins:** both are inventory entries with config, both produce heartbeats, both surface drift the same way. The contract doesn't care where the agent runs.
 
-- **Plugin types vs instances.** A *type* is the deployable unit (code, bootstrap, version). An *instance* is a runtime entity bound to inventory — `windows-pc` running on `gamingrig` governing `kid1`. Types live in a static registry in the core image; instances live in inventory.
-- **Per-instance token read-scope.** When you add `windows-pc` to a device's plugin list, the core mints a token scoped to that instance — it can read only that user's effective state and heartbeat only as that instance. V1 issues per-instance tokens (per ADR-006) but doesn't yet enforce read-scope limits; that tightening lands later.
-- **Type-level capability registry.** Each type declares which device `os` and `type` it applies to, which scopes it supports (`user`, `shared`), and which config keys it requires. Lets the (future) GUI offer constrained dropdowns instead of free-form strings.
-- **Plugins as dumb executors.** A plugin reads its scoped state from the API, reconciles, heartbeats. It does not announce itself, does not carry config that only it knows about — config lives in its inventory record on the core.
-- **Symmetric add/remove ritual.** Adding: edit inventory → core mints a token → operator runs bootstrap. Removing: edit inventory → core revokes token → next agent tick gets 401.
+## ADR-008: Effective state is a rule pipeline
 
-**Why this end-state:** single source of truth (inventory), clean authorization model (tokens scoped by inventory entries), symmetric onboarding for in-core and per-device plugins, and concrete UI/CLI semantics ("add plugin to device") rather than ambient discovery.
+**Decided:** `GET /v1/state/effective/{user}` returns `{locked: bool, reasons: [...]}`. The `locked` value is the OR of registered rule outputs; the `reasons` array names which rules fired. Rules implement a single interface and register at startup.
 
-**Note for revisit:** this area is dense. The V1 cut is intentionally minimal so we can get the rest of the system live and revisit the model in flight before V2 ramps it up.
+**Rejected:** hardcoded if/else in the lock computation. Each new feature would touch the central function and create regression risk; the call signature and response shape would drift as features arrive.
 
-## What's still open
+**Why a pipeline:**
 
-See the **Open questions** section of [PLAN.md](PLAN.md) — those are decisions deferred until V1 implementation begins.
+- Every new lock condition (schedule, budget, shared-device) is a new rule registered into the same machinery. No API or schema reshape.
+- Plugins always see the same response shape regardless of which rules are registered. They don't need to know schedule expressions or budget math exist.
+- The `reasons` array makes "why is this user locked?" trivially observable in the UI and the audit log.
+- Tests for one rule don't entangle with another.
+
+## ADR-009: Agent updates are versioned and hash-verified
+
+**Decided:** agents fetch their code via a manifest endpoint (`GET /v1/agents/{type}/manifest` → `{version, sha256, url}`). The agent verifies the SHA-256 of the fetched artifact matches the manifest before swapping atomically. Update checks happen on a slow tick (default hourly); state polling on the fast tick (default 60s).
+
+**Rejected:** "fetch latest `agent.ps1` every minute and execute." Trivially exploitable: anyone who controls the core's static-file path (or MITMs HTTPS without certificate pinning) gets remote code execution on every kid PC, with whatever privileges the agent runs at — admin-equivalent for `windows-pc` (it modifies NTFS ACLs and registry).
+
+**Why this is a kernel commitment, not a feature:**
+
+- The agent fetch path is a remote-code-execution channel from the core to every privileged agent. There is no acceptable version of this without integrity checks.
+- Versioning makes rollbacks possible and update cadence explicit; hash verification closes the MITM gap with no signing infrastructure required.
+- Adding versioning + hash verification later means refitting every existing plugin's update path. Cheaper to ship it once.
+
+**Future tightening (a feature, not the kernel):** manifest signing with a long-lived private key on the core and a public key embedded in the bootstrap. Closes the gap if the core itself is partially compromised.
+
+## ADR-010: A plugin SDK is part of the kernel
+
+**Decided:** the kernel ships a Python SDK (`curfew_plugin_sdk`) and a PowerShell module (`curfew-plugin.psm1`) that handle polling, heartbeating, retry/backoff, hash-verified self-update, and error reporting. A plugin's business logic is the reconciler — given the effective state, do the right thing. The SDK handles everything else.
+
+**Rejected:** each plugin rolls its own loop.
+
+**Why kernel rather than feature:**
+
+- Six expected plugins → six bug surfaces for the same boilerplate. Inconsistent retry semantics, inconsistent self-update mechanics, inconsistent error reporting are the predictable outcome.
+- The SDK *shapes* the plugin contract. Adding it later effectively rewrites the contract retroactively (every existing plugin migrates). Cheaper to ship it once and have every plugin conform from day one.
+- `windows-pc` is the first SDK consumer and stress-tests the contract before any second plugin starts.

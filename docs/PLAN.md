@@ -1,15 +1,15 @@
 # curfew — Plan
 
-CLI- (and eventually web-) driven tool to manage kid screentime across the household. Built around an **API-first, plugin-based** architecture: a small dockerized core service holds state and exposes an HTTP API; *plugins* implement specific enforcement methods (Windows PC lockout, DNS sinkhole, smart plugs, router ACLs, etc.). New methods are added by writing new plugins. The CLI is a thin client of the API; a web UI lands later as another client.
+CLI- and (later) web-driven tool to manage screentime across the household. Built around an **API-first, plugin-based** architecture: a small dockerized core service holds state and exposes an HTTP API; *plugins* implement specific enforcement methods (Windows PC lockout, DNS sinkhole, smart plugs, router ACLs, etc.). New methods are added by writing new plugins. The CLI and a future GUI are both thin clients of the same API.
 
 ## Goals
 
-1. **Modular** — each enforcement method is an independent plugin. The Windows PC enforcer is just one of many.
-2. **API-first** — the core HTTP API is the contract. CLI, GUI, plugins, and any future surface are all clients of it.
-3. **Docker-hosted core** — assume the user runs the core as a docker compose stack alongside their other homelab services. Matches the `docker/apps/` pattern.
-4. **CLI today, GUI later** — same API serves both. No refactor needed when the GUI lands.
-5. **Pull-based enforcement** — plugins reconcile against state on a timer. Self-heals through reboots, sleep, and network changes. Push (long-polling / SSE) is a future addition.
-6. **Well-tested** — the core, the CLI, and the plugin agents all have automated tests running in CI.
+1. **Modular** — each enforcement method is an independent plugin.
+2. **API-first** — the core HTTP API is the contract. CLI, GUI, plugins, and any future surface are all clients.
+3. **Docker-hosted core** — the user runs the core as a docker compose stack alongside other homelab services.
+4. **Pull-based enforcement** — plugins reconcile against state on a timer. Self-heals through reboots, sleep, and network changes.
+5. **Well-tested** — core, CLI, plugin SDK, and individual plugins all have automated tests in CI.
+6. **Kernel-then-features progression** — build a complete kernel up front; layer features on top in any order.
 
 ## Architecture & topology
 
@@ -19,9 +19,8 @@ CLI- (and eventually web-) driven tool to manage kid screentime across the house
 | (your laptop)    |     | (docker compose)      |     |                             |
 |                  |     |                       |     |                             |
 |  $ curfew lock   | --> |  curfew-core (FastAPI)| <-- |  agent.ps1                  |
-|     kid1         |     |  inventory.yaml +     |     |  Scheduled Task, every 1min |
-|                  |     |  state.sqlite (vols)  |     |  applies icacls + registry  |
-|                  |     |  behind Traefik       |     |                             |
+|     kid1         |     |  state.sqlite (volume)|     |  Scheduled Task, every 1min |
+|                  |     |  behind Traefik       |     |  applies icacls + registry  |
 |  curfew CLI      |     |                       |     |                             |
 |  (HTTP client)   |     |  + future: web UI     |     |  installed once via         |
 |                  |     |    served by same     |     |  install-agent.ps1          |
@@ -35,90 +34,65 @@ CLI- (and eventually web-) driven tool to manage kid screentime across the house
 Three places code physically lives:
 
 - **Parent's machine** — CLI binary/script. Stateless. Each invocation is short-lived. Talks to the core's API over HTTPS.
-- **Homelab host** — one docker compose stack: a single FastAPI container serving the API, fronted by your existing Traefik. Persists `inventory.yaml` (config volume, human-edited) and `state.sqlite` (data volume, API-written) — see the Storage model section.
+- **Homelab host** — one docker compose stack: a single FastAPI container serving the API, fronted by your existing Traefik. Persists `state.sqlite` in a docker volume.
 - **Each kid PC** — small PowerShell agent + a Windows Scheduled Task. Installed once via a bootstrap script. The agent fetches state from the API on each tick and reconciles local enforcement.
 
-## Plugin model
+## Plan shape: kernel + features
 
-A plugin is anything that:
+The plan is *not* a feature timeline (V1 → V5+). It's two sections:
 
-1. **Authenticates** to the core API with a per-instance bearer token.
-2. **Reads state** via `GET /v1/state/effective/{user}` (or a filtered variant).
-3. **Reconciles** its slice of the world to match. Idempotent — if state hasn't changed, no-op.
-4. **Heartbeats** on every tick (`POST /v1/plugins/{name}/heartbeat`) so the core can detect drift between expected instances (from `inventory.yaml`) and actual liveness (per ADR-008).
+- **The kernel** is the set of architectural primitives every feature depends on. It is built once, complete and tested. Features stack on top without reshaping the kernel.
+- **Features** are unordered. Implement whatever's most needed when. Manual lock can come before schedule lock; adguard can come before windows-pc; the GUI can come before budgets. The kernel doesn't notice.
 
-That's the whole contract. Concretely a plugin is a long-running poller (or a cron-driven script) plus a small config file telling it where the API lives and which instance name (e.g. `windows-pc:gamingrig`) it identifies as. The set of expected instances is declared in `inventory.yaml` — plugins do not announce themselves.
+This shape exists because the alternative — feature-phased V1 → V5+ — keeps creating "we'll add it in V2" commitments that turn into refactors. The kernel is bigger up front; everything after it is genuinely additive.
 
-### Plugin types: in-core vs. per-device
+---
 
-Plugins fall into two categories based on where they run:
+# The kernel
 
-**In-core plugins** — run inside (or as a sidecar to) the curfew-core docker stack. Reach out to external systems from there.
-- Example: `adguard` plugin (talks to AdGuard's REST API), `smart-plug` (Tasmota HTTP), `router-acl` (UniFi/OPNsense API).
-- Distribution: ship as part of the core docker image, or as additional compose services.
+## Storage
 
-**Per-device plugins** — run *on* the device they govern, because they need OS-level access there.
-- Example: `windows-pc` (NTFS ACLs, registry policy), eventually `macos-pc`.
-- Distribution: a one-time install script per device. The agent then self-updates by fetching the latest version from the core on each tick.
+A single store: **`state.sqlite`** in a docker volume. SQLModel for the schema, Alembic for migrations from day one. No additional config files in the architecture.
 
-Both kinds talk to the same API the same way. The difference is purely deployment.
+The schema is created in the initial migration with all fields the system will ever need — even fields no rule reads yet. New features may add tables (e.g. `usage_minutes` when the budget feature lands), but they don't reshape existing tables.
 
-## Storage model
+### Tables
 
-Persistent data lives in two places, one human-edited and one machine-written:
+| Table | Purpose |
+|-------|---------|
+| `users` | name (PK), role, target_apps (JSON list), schedule (JSON expr, nullable), budget_minutes (int, nullable) |
+| `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
+| `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
+| `device_plugins` | (device, type) — plugin types expected to govern this device |
+| `core_plugins` | (type, instance_id, config JSON) — in-core plugins (e.g. `adguard` governing all kids) |
+| `plugin_instances` | name (PK, e.g. `windows-pc:gamingrig`), type, last_heartbeat, last_seen_version |
+| `plugin_tokens` | token_hash (PK), instance, created_at, revoked_at |
+| `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
+| `audit_log` | id (PK), actor, action, target, payload (JSON), occurred_at |
+| `manifests` | type (PK), version, sha256, agent_url — versioned agent artifacts |
 
-- **`inventory.yaml`** — users, devices, and the global app catalog. Edited by hand (or by a CLI command that rewrites the file). Loaded on startup; reloaded on demand.
-- **`state.sqlite`** — runtime state written by the API: user locks, plugin heartbeats and last-seen, future budget tallies and audit log. SQLite from V1 with SQLModel + Alembic migrations.
+### Inventory data model — concepts
 
-See [DECISIONS.md](DECISIONS.md) ADR-005 (SQLite from V1) and ADR-007 (inventory file split) for rationale.
+**Users** are anyone whose screentime curfew might govern (kids) or who manages it (parents). Schedules and budgets attach to people, not devices — a kid with one PC and one tablet shares one daily budget across both.
 
-### `inventory.yaml` shape (V1)
+| Field | Why it matters |
+|-------|----------------|
+| `name` | Stable identifier used in CLI/API/UI. Short string (`kid1`), not a real name. |
+| `role` | `parent` or `child`. Distinguishes who governs from who is governed; future auth/RBAC keys off this. |
+| `target_apps` | Apps that get blocked when this user is in an effective-lock state. References keys in `apps`. |
+| `schedule` | Optional schedule expression (e.g. `"weekday 16:00-20:00"`). Read by the schedule-lock feature when registered. |
+| `budget_minutes` | Optional daily/weekly budget. Read by the budget-lock feature when registered. |
 
-```yaml
-users:
-  kid1:
-    role: child
-    target_apps: [steam, minecraft, youtube]
-  parent:
-    role: parent
+**Devices** are physical things curfew (or a plugin) can act on.
 
-devices:
-  gamingrig:
-    owner: kid1            # owner of this device; null/omitted = shared
-    type: pc               # pc | laptop | phone | tablet | console | tv
-    os: windows            # windows | macos | linux | ios | android
-    managed: true
-    mac: ["aa:bb:cc:dd:ee:ff"]
-    plugins: [windows-pc]  # plugin types expected to govern this device
-
-apps:
-  steam:
-    exe_paths: ['C:\Program Files (x86)\Steam\steam.exe']
-    process_names: [steam]
-  minecraft:
-    exe_paths: ['C:\Users\*\AppData\Roaming\.minecraft\...']
-    process_names: [javaw]
-  youtube:
-    urls: [youtube.com, "*.youtube.com", youtu.be]
-```
-
-The inventory is intentionally plugin-agnostic — `apps` describes apps in plugin-neutral terms; each plugin reads what's relevant to it (a Windows plugin uses `exe_paths`; a hypothetical macOS plugin uses bundle IDs from the same entry).
-
-**Per-field notes:**
-
-*Users:*
-- `name` (the YAML key) — stable identifier used in CLI, API, and UI. Short string (`kid1`), not a real name.
-- `role` — `parent` or `child`. Distinguishes who governs from who is governed; future auth/RBAC keys off this.
-- `target_apps` — apps that get blocked when this user is in an effective-lock state (manual today; out-of-schedule and budget-exhausted in later phases). References keys in the `apps` catalog.
-
-*Devices:*
-- `name` (the YAML key) — used in CLI/UI and as part of plugin instance names (`windows-pc:gamingrig`).
-- `owner` — the user this device belongs to. For managed devices, also the user whose schedule/budget activity here debits. Omit (or set null) for shared devices (common-area TV, family tablet); the `--shared` flag governs those as a group from V2 onward.
-- `type` — `pc | laptop | phone | tablet | console | tv`. Informs which plugins are applicable; a phone never gets `windows-pc`.
-- `os` — `windows | macos | linux | ios | android`. Selects per-device plugin variants when one exists.
-- `mac` — list. Network-layer identity, stable across IP changes; needed by network-side plugins (DNS sinkhole, router ACL). A device commonly has multiple MACs (laptop with Wi-Fi *and* ethernet; phones/tablets that randomize per network) — all entries identify the same device.
-- `managed` — whether curfew governs this device. Lets the inventory list parents' devices for completeness without putting them under policy.
-- `plugins` — plugin types expected to govern this device. Inventory-as-desired-state per ADR-008.
+| Field | Why it matters |
+|-------|----------------|
+| `name` | Used in CLI/UI and as part of plugin instance names (`windows-pc:gamingrig`). |
+| `owner` | The user this device belongs to. For managed devices, also the user whose schedule/budget activity here debits. Null = shared device (governed as a group via the shared-device-lock feature when registered). |
+| `type` | `pc | laptop | phone | tablet | console | tv`. Constrains which plugin types apply. |
+| `os` | `windows | macos | linux | ios | android`. Selects per-device plugin variants. |
+| `mac` | Network-layer identity, stable across IP changes. List, since a device commonly has multiple MACs (Wi-Fi + ethernet; randomized per network). Read by network-side plugins. |
+| `managed` | Whether curfew governs this device at all. Lets the inventory list parents' devices for completeness without putting them under policy. |
 
 **Why people *and* devices, not just users-with-a-list-of-devices:**
 
@@ -132,178 +106,273 @@ The inventory is intentionally plugin-agnostic — `apps` describes apps in plug
 - Static-vs-dynamic IP — irrelevant; we key on MAC.
 - Hardware specs, purchase dates, warranty — asset-management territory.
 
-### `state.sqlite` schema (V1)
+## Effective-state rule pipeline
 
-| Table | Purpose |
-|-------|---------|
-| `user_locks` | One row per user. `manual_lock: bool`, `set_at`, `set_by`. |
-| `plugin_instances` | One row per expected instance (derived from inventory on startup/reload). `name` (e.g. `windows-pc:gamingrig`), `last_heartbeat`, `last_seen_version`. |
-| `plugin_tokens` | One token per plugin instance (per ADR-006). Hashed at rest. Read-scope tightening (limiting what each token can read) is a V5+ item. |
+`GET /v1/state/effective/{user}` returns `{locked: bool, reasons: [...]}`. The `locked` value is the OR of registered rule outputs; `reasons` names which rules fired.
 
-V2 adds `schedules`. V3 adds `usage_minutes` (budget tally) and `audit_log`. Migrations are tracked from day one so V2/V3 are additive, not panicked ports.
+Rules implement a single interface and register at startup. The kernel ships with **one rule: `manual_lock`**. Every additional feature (schedule lock, budget lock, shared-device lock) is a new rule registered into the same pipeline — no API or schema reshape, no central if/else to edit.
 
-### Plugin instance naming
+## Plugin instance lifecycle
 
-Plugin instances are referenced as `<type>` for in-core plugins (`adguard`, `smart-plug`) and `<type>:<device-name>` for per-device plugins (`windows-pc:gamingrig`, `macos-pc:laptop`). The expected set of instances is derived from `inventory.yaml`: each `devices.{name}.plugins` entry that references a per-device type produces one instance; in-core plugin types produce one instance per configured deployment.
+A *plugin instance* is the runtime entity. Instances are declared in inventory:
 
-## API surface (V1 target)
+- **Per-device plugins**: each `device_plugins(device, type)` row produces an instance named `<type>:<device>` (e.g. `windows-pc:gamingrig`).
+- **In-core plugins**: each `core_plugins(type, instance_id)` row produces an instance named `<type>` if singular, or `<type>:<instance_id>` if multiple (e.g. `adguard`, or `smart-plug:livingroom`).
+
+Each plugin type registers a **capability descriptor** at core startup, declaring which device `os` and `type` values it applies to, which scopes it supports (`user`, `shared`), and which config keys it requires. The descriptor lets the (future) GUI offer constrained dropdowns.
+
+Lifecycle:
+
+1. Operator adds the inventory entry (`curfew plugin assign windows-pc gamingrig`).
+2. Operator mints a per-instance bearer token (`curfew plugin token mint windows-pc:gamingrig`). Hashed at rest.
+3. For per-device plugins: operator runs the bootstrap one-liner on the device with the token. The bootstrap fetches the agent via the versioned manifest (see below).
+4. Plugin heartbeats every tick (`POST /v1/plugins/{instance}/heartbeat`).
+5. Core compares expected instances (from inventory) to actual heartbeats; surfaces drift on `GET /v1/plugins`.
+6. Removal: delete the inventory entry → core revokes the token → next agent tick gets 401 → operator runs uninstall on the device.
+
+## Agent update integrity
+
+Plugins running on devices fetch their agent code from the core. Updates are versioned and hash-verified:
+
+- `GET /v1/agents/{type}/manifest` → `{ version, sha256, url }`.
+- Agent compares the manifest's version to its installed version. If different: fetch `url`, verify SHA-256 matches the manifest, swap atomically.
+- Update check runs on a slow tick (default hourly); state polling stays on the fast tick (default 60s). Failure to fetch a manifest never blocks state polling.
+- Operator publishes a new agent version by uploading an artifact and rotating the `manifests` row.
+
+Future tightening (future feature, not the kernel): manifest signing with a long-lived key embedded in the bootstrap. The kernel design accommodates this without reshape.
+
+## Plugin SDK
+
+The kernel ships a plugin SDK in two flavors:
+
+- **Python SDK** (`curfew_plugin_sdk`) — for in-core plugins and any per-device plugin running on Linux/macOS.
+- **PowerShell module** (`curfew-plugin.psm1`) — for windows-pc and any future Windows-resident plugin.
+
+Both expose:
+
+- Polling loop with configurable tick rate
+- Heartbeat dispatch with retry/backoff
+- Versioned + hash-verified self-update
+- Error reporting back to core (via heartbeat payload)
+- Config bootstrap (instance name, API URL, token)
+
+A plugin's business logic is the **reconciler** — given the effective state, do the right thing. The SDK handles everything else. windows-pc is the first SDK consumer and stress-tests the contract.
+
+## Authentication
+
+- **Plugin auth**: per-instance bearer tokens (ADR-006). Hashed at rest. Read scope is full state in the kernel; future tightening to scoped reads is a feature on top.
+- **Admin auth**: V1 uses a single admin bearer token from env var. The API surface is shaped so a future GUI can add session tokens (OAuth/local sessions) without renaming endpoints.
+
+## Audit log
+
+Every API write goes through a single audit middleware that records `(actor, action, target, payload, occurred_at)` to the `audit_log` table. The kernel writes the log; reads via API are a feature on top.
+
+## OpenAPI contract
+
+Pydantic v2 schemas everywhere. OpenAPI auto-emitted at `/v1/openapi.json`. CLI types and (future) GUI types generated from the same source — renames become a build error, not a runtime surprise.
+
+## API surface (kernel)
 
 ```
-POST   /v1/auth/token                     # exchange long-lived secret for short token (later)
-GET    /v1/state                          # merged inventory + runtime view (admin/debug)
-GET    /v1/state/effective/{user}         # computed effective lock + reasons (for plugins)
-POST   /v1/users/{user}/lock              # manual lock
-POST   /v1/users/{user}/unlock            # manual unlock
-GET    /v1/users                          # list users + summary
-GET    /v1/plugins                        # expected instances (from inventory) + heartbeat status (drift visible here)
-POST   /v1/plugins/{name}/heartbeat       # plugin liveness
-POST   /v1/admin/reload-inventory         # re-read inventory.yaml from disk
+Inventory CRUD
+  GET    /v1/users                              list
+  GET    /v1/users/{user}                       fetch
+  POST   /v1/users                              create
+  PATCH  /v1/users/{user}                       update
+  DELETE /v1/users/{user}                       delete
+
+  GET    /v1/devices                            list
+  GET    /v1/devices/{device}                   fetch
+  POST   /v1/devices                            create
+  PATCH  /v1/devices/{device}                   update
+  DELETE /v1/devices/{device}                   delete
+
+  GET    /v1/apps                               list
+  GET    /v1/apps/{app}                         fetch
+  POST   /v1/apps                               create
+  PATCH  /v1/apps/{app}                         update
+  DELETE /v1/apps/{app}                         delete
+
+Plugin lifecycle
+  GET    /v1/plugins                            expected instances + heartbeat status (drift)
+  GET    /v1/plugins/types                      registered types + capability descriptors
+  POST   /v1/plugins/assignments                add instance to inventory
+  DELETE /v1/plugins/assignments/{instance}     remove instance from inventory
+  POST   /v1/plugins/{instance}/tokens          mint a bearer token (returns the secret once)
+  DELETE /v1/plugins/{instance}/tokens/{id}     revoke
+  POST   /v1/plugins/{instance}/heartbeat       liveness (called by the agent)
+  POST   /v1/plugins/{instance}/activity        activity tick (no-op until budget rule registered)
+
+Locks
+  POST   /v1/users/{user}/lock                  manual lock
+  POST   /v1/users/{user}/unlock                manual unlock
+
+Effective state
+  GET    /v1/state                              full snapshot (admin)
+  GET    /v1/state/effective/{user}             { locked: bool, reasons: [...] }
+
+Agent updates
+  GET    /v1/agents/{type}/manifest             { version, sha256, url }
+  GET    /v1/agents/{type}/{version}            agent artifact (the agent.ps1 / .py / .sh)
+
+Health
+  GET    /v1/health                             liveness probe
 ```
 
-V2 adds `/v1/users/{user}/schedule`, device-as-resource endpoints, and shared-device locking (`POST /v1/shared/lock`/`unlock`). V3 adds `/v1/users/{user}/budget` + `POST /v1/plugins/{name}/activity` (activity tracking, distinct from the liveness heartbeat). V5+ adds per-device app overrides.
+## CLI shape (kernel)
+
+```
+curfew user        add | list | show | edit | rm
+curfew device      add | list | show | edit | rm
+curfew app         add | list | show | edit | rm
+curfew plugin      assign | unassign | types | list | drift
+curfew plugin token  mint | revoke | list
+curfew lock        <user>
+curfew unlock      <user>
+curfew status                                # human-readable summary
+curfew status --json                         # machine-readable
+```
 
 ## Repository layout
 
 ```
 curfew/
 ├── src/
-│   ├── curfew/                     # shared library (inventory + state models, plugin contract, schemas)
-│   ├── curfew_api/                 # FastAPI service — the docker-hosted core
-│   │   └── migrations/             # Alembic migrations for state.sqlite
-│   └── curfew_cli/                 # CLI — thin HTTP client
+│   ├── curfew/                       # shared library — models, schemas, rule interface, plugin contract
+│   ├── curfew_api/                   # FastAPI service
+│   │   └── migrations/               # Alembic
+│   ├── curfew_cli/                   # CLI — thin HTTP client
+│   ├── curfew_plugin_sdk/            # Python plugin SDK
+│   └── curfew_plugin_powershell/     # PowerShell plugin SDK module
 ├── plugins/
 │   └── windows-pc/
-│       ├── agent.ps1               # the per-tick agent
-│       ├── install-agent.ps1       # bootstrap installer
-│       └── tests/                  # Pester tests
+│       ├── agent.ps1                 # the per-tick agent (uses the PowerShell SDK)
+│       ├── install-agent.ps1         # bootstrap installer
+│       └── tests/                    # Pester tests
 ├── tests/
-│   ├── unit/                       # inventory + state models, schema validation
-│   ├── api/                        # FastAPI TestClient integration tests
-│   ├── cli/                        # CLI against a mocked or real API
-│   └── e2e/                        # docker-compose-up + CLI roundtrip
+│   ├── unit/                         # models, schemas, rule pipeline, SDK
+│   ├── api/                          # FastAPI TestClient integration tests
+│   ├── cli/                          # CLI against a mocked or real API
+│   └── e2e/                          # docker-compose-up + CLI roundtrip + reference plugin
 ├── docker/
-│   ├── Dockerfile                  # builds curfew_api into a slim image
-│   └── compose.yml                 # for homelab deployment
+│   ├── Dockerfile
+│   └── compose.yml
 ├── docs/
-│   ├── PLAN.md                     # this file — scope and roadmap
-│   ├── DECISIONS.md                # ADRs
-│   ├── api.md                      # API contract (or auto-gen from OpenAPI)
-│   ├── plugin-contract.md          # how to write a plugin
-│   └── topology.md                 # what runs where, how to deploy
-├── examples/
-│   └── inventory.example.yaml      # commented inventory template
+│   ├── PLAN.md
+│   └── DECISIONS.md
 ├── .github/workflows/
-│   ├── ci.yml                      # lint, type-check, pytest (Linux)
-│   └── windows.yml                 # Pester tests on Windows runner
+│   ├── ci.yml                        # ruff + mypy + pytest (Linux)
+│   └── windows.yml                   # Pester (Windows runner)
 ├── pyproject.toml
 └── README.md
 ```
 
 ## Testing strategy
 
-Testing is first-class. Rough targets:
-
 | Layer | Framework | What's covered |
 |-------|-----------|----------------|
-| Inventory model | pytest | YAML load/validate, schema errors surfaced clearly, reload semantics. |
-| State model | pytest + in-memory SQLite | All transitions, schema validation, migrations apply cleanly forward, persistence round-trips. ≥90% coverage. |
-| API | pytest + FastAPI TestClient (httpx) | Every endpoint: happy path, auth failures, validation errors, idempotency. |
-| Plugin contract | pytest with a fake plugin | A reference test plugin exercises the full contract; serves as living documentation. |
+| Inventory + state models | pytest + in-memory SQLite | CRUD round-trips, schema validation, migrations apply forward, FK/uniqueness behaviour. ≥90% coverage. |
+| Rule pipeline | pytest | Rule registration, OR composition, reasons aggregation, behaviour with zero rules. |
+| Plugin contract | pytest with a fake plugin | Reference test plugin exercises the full contract; serves as living documentation. |
+| Plugin SDK (Python) | pytest | Polling loop, heartbeat retry, manifest fetch, hash mismatch refusal. |
+| Plugin SDK (PowerShell) | Pester | Same coverage, on the Windows runner. |
+| API | pytest + FastAPI TestClient | Every endpoint: happy path, auth failures, validation errors, idempotency. |
+| Agent update flow | pytest + Pester | Manifest endpoint, hash verification, atomic swap, rollback on failed swap. |
 | CLI | pytest + httpx mocking | Each command, exit codes, output formatting. |
-| Windows agent | Pester (Windows CI runner) | ACL apply/revert, registry policy, idempotency, error paths. |
-| End-to-end | pytest + docker compose | Spin up the stack, run CLI commands, assert state changes propagate. |
+| Audit log | pytest | Every API write produces a row; payloads are structured. |
+| End-to-end | pytest + docker compose | Spin up the stack, run CLI, observe plugin instance heartbeat + drift. |
 
 CI runs on every push:
 - **Linux runner**: ruff + mypy + pytest (unit, API, CLI, e2e with docker compose).
-- **Windows runner**: Pester for the `windows-pc` plugin agent + installer smoke test.
+- **Windows runner**: Pester for the PowerShell SDK + windows-pc agent + installer smoke test.
 
 Pre-commit hooks for lint/format. Type hints required (`mypy --strict` for the core).
 
-## Phasing
+## Acceptance: kernel done
 
-### V1 — core API + CLI + `windows-pc` plugin, on-demand
+The kernel is "done" when this end-to-end walkthrough passes:
 
-**Goal:** prove the full loop with one real plugin and a working CLI. No schedules, no UI.
+1. CLI creates a user (`curfew user add kid1 --role child`), a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`), and an app (`curfew app add steam --exe-path ...`).
+2. CLI assigns the windows-pc plugin to the device (`curfew plugin assign windows-pc gamingrig`).
+3. CLI mints a token (`curfew plugin token mint windows-pc:gamingrig`) and prints a bootstrap one-liner.
+4. windows-pc agent on a real PC runs the bootstrap. The bootstrap fetches the manifest, verifies the SHA-256, installs the agent, registers the scheduled task.
+5. Agent heartbeats; `GET /v1/plugins` shows it healthy.
+6. Stop the agent; `GET /v1/plugins` shows drift within 2 ticks.
+7. CLI locks the user (`curfew lock kid1`); the manual_lock rule fires; `GET /v1/state/effective/kid1` returns `{locked: true, reasons: ["manual_lock"]}`.
+8. Agent reads the effective state, kills matching processes, applies ACLs.
+9. CLI unlocks; agent reverses.
+10. `audit_log` table contains a structured row for every API write in the sequence.
 
-- **Core**: FastAPI service in a single docker container. `inventory.yaml` (mounted from a config volume) + `state.sqlite` (in a data volume). SQLModel + Alembic from day one. Per-instance bearer auth (ADR-006). Endpoints: `GET /v1/state`, `GET /v1/state/effective/{user}`, `GET /v1/users`, `POST /v1/users/{user}/lock`, `POST /v1/users/{user}/unlock`, `GET /v1/plugins` (with drift status), `POST /v1/plugins/{name}/heartbeat`, `POST /v1/admin/reload-inventory`.
-- **CLI**: `curfew lock <user>`, `curfew unlock <user>`, `curfew status`. Reads config from `~/.config/curfew/config` (API URL + bearer).
-- **Plugin: `windows-pc`**: PowerShell agent + Scheduled Task. Polls every minute. Applies/removes NTFS deny-execute on configured .exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes. Self-updates from `/plugins/windows-pc/agent.ps1` on the core.
-- **Bootstrap**: one-line PowerShell installer registers the scheduled task, drops `agent.config` (API URL, bearer, instance name e.g. `windows-pc:gamingrig`). V1 token issuance is manual — the operator generates a token (one-shot helper or `inventory.yaml` seed) and pastes it into the bootstrap command; a structured token-management CLI lands in V2 alongside the device endpoints.
-- **Acceptance**: from your laptop, `curfew lock kid1` → within 60 seconds, Steam and Minecraft can't launch on the kid PC and YouTube is blocked in Chrome/Edge (every app in kid1's `target_apps`). `curfew unlock kid1` reverses it.
-- **Tests**: full pytest suite green; Pester tests green; e2e test (`docker compose up` + CLI round-trip) green in CI.
+---
 
-### V2 — schedules + device endpoints + shared-device locking (additive)
+# Features
 
-- State adds `schedule` per user: `"weekday 16:00-20:00"`. **Schedule evaluation lives in core** — plugins still see only `effective_lock: bool`.
-- Device-as-resource endpoints: `GET /v1/devices`, `GET /v1/devices/{name}`, optional per-device filtered state for plugins.
-- Shared-device locking: state gains `shared_lock: bool`, API gains `POST /v1/shared/lock`/`unlock`, CLI gains `curfew lock --shared`. Locks are unconditional (a shared lock blocks everyone).
-- CLI grows: `curfew schedule <user> "<expr>"`, `curfew lock --shared`.
-- New tests: schedule expression parsing, time-zone handling, transitions across midnight/DST, shared-lock propagation.
+Features stack on top of the kernel without reshaping it. **Order is arbitrary** — implement whichever is most needed when. The list below is roughly ordered by logical dependency (manual lock first because it's the kernel's reference rule; budget after schedule because both build on the same rule machinery), but the order isn't load-bearing.
 
-### V3 — budgets (additive)
+## Manual lock rule (kernel reference)
 
-- Plugins gain an activity heartbeat: `POST /v1/plugins/{name}/activity` when there's recent user input. Distinct from the liveness heartbeat at `/v1/plugins/{name}/heartbeat`.
-- Core tallies usage per user, decrements `budget_minutes_remaining` (resets daily/weekly).
-- Effective lock = `manual_lock || out_of_schedule || budget_exhausted`.
-- New tests: budget accounting, heartbeat dedup, activity-window logic.
+The first rule registered. Reads `user_locks.manual_lock`; returns `(locked, "manual_lock")` when set. Ships with the kernel as the proof-of-concept rule.
 
-### V4 — web UI + second plugin
+## Schedule lock rule
 
-- Web UI (Vite + a small SPA, or HTMX-style server-rendered) bundled into the same docker image. Same API.
-- Build an `adguard` in-core plugin (DNS sinkhole via AdGuard Home's REST API).
-- Tests: API contract tests pinned (regression guard once UI exists); plugin tests for `adguard`.
+Reads `users.schedule`; evaluates against current time + timezone; returns `(locked, "out_of_schedule")` when out of window. CLI: `curfew schedule <user> "<expr>"`. Tests: expression parsing, time-zone handling, transitions across midnight/DST.
 
-### V5+ — backlog plugin candidates and deferred features
+## Budget lock rule + activity ingestion
 
-Plugin candidates:
+Adds `usage_minutes(user, day, minutes)` table via Alembic migration. Plugins call `POST /v1/plugins/{instance}/activity` (the kernel endpoint that was a no-op) when there's recent user input. Core tallies; budget rule returns `(locked, "budget_exhausted")` when `users.budget_minutes` is consumed. Resets daily/weekly. CLI: `curfew budget <user> <minutes>`.
 
-- `smart-plug` — Tasmota/Kasa power control.
-- `router-acl` — UniFi/OPNsense API.
-- `tailscale-acl` — gate egress for tailnet kid devices.
-- `macos-pc` — same primitives translated.
+## Shared-device lock + `--shared` operations
 
-Deferred features (no plugin work):
+Adds a device-level `shared_lock` flag (or a `shared_locks` table). New rule that's evaluated only for shared-device contexts. CLI: `curfew lock --shared` and `curfew unlock --shared`. Endpoints: `POST /v1/shared/lock` / `unlock`.
 
-- **Per-device app overrides** — let a single device declare alternate paths/process names for an app in the global catalog. Replace semantics (override list replaces global list for that device, not merge). Deferred until enough installs exist that non-default paths are common in practice.
-- **Long-polling / SSE push** so plugins react in seconds rather than within-the-tick latency.
-- **Per-instance token read-scope** — V1 issues per-instance tokens (ADR-006) for revocation granularity, but they aren't yet limited in what state they can read. Tightening so that a `windows-pc:gamingrig` token can only read kid1's state is deferred.
+## Per-device app overrides
 
-## Open questions (decide before V1)
+Adds a `device_app_overrides(device, app, exe_paths, process_names, urls)` table. Resolution path in the core: when a plugin reads effective state for a device, the global app entry is overridden by the device's row if present. **Replace** semantics — override list replaces global list, not merge.
 
-Resolved during the reconciliation pass — see DECISIONS.md for details:
+## Plugins
 
-- ~~State backend~~ → SQLite from V1, with `inventory.yaml` separate (ADR-005, ADR-007).
-- ~~Auth model~~ → per-instance bearer tokens from day one (ADR-006).
-- ~~Plugin assignment direction~~ → inventory-as-desired-state + heartbeats (ADR-008).
-- ~~User vs people terminology~~ → `users` with `role` field.
+Each plugin is a new type with: a capability descriptor, an SDK consumer (Python or PowerShell), and a bootstrap one-liner if per-device. Implementations:
 
-Still open:
+- **`windows-pc`** (per-device, PowerShell SDK) — first plugin; stress-tests the SDK and shapes the contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
+- **`adguard`** (in-core, Python SDK) — first in-core plugin; stress-tests the in-core path. DNS sinkhole via AdGuard Home REST API.
+- **`smart-plug`** (in-core, Python SDK) — Tasmota/Kasa power control.
+- **`router-acl`** (in-core, Python SDK) — UniFi/OPNsense API.
+- **`tailscale-acl`** (in-core, Python SDK) — gate egress for tailnet kid devices.
+- **`macos-pc`** (per-device, Python SDK on macOS) — same primitives translated.
 
-1. **API serialization** — Pydantic v2 schemas everywhere; emit OpenAPI for docs and future TS client gen. *(Lean: yes, no real alternative.)*
-2. **Plugin agent language for `windows-pc`** — pure PowerShell (zero deps on Windows) or Python (cleaner JSON / state logic, requires runtime install)? *Lean: PowerShell to keep kid PCs dependency-free.*
-3. **Mid-session lock behaviour** — kill running processes immediately, force logoff, or just block future launches? *Lean: kill matching processes (with a config knob to opt out).*
-4. **Initial app list** — Steam, Minecraft, YouTube definite; decide now on Roblox, Discord, Twitch.
-5. **CI runners** — public GitHub Actions (free Windows runner) vs. self-hosted on the homelab? *Lean: GitHub Actions until private code or speed becomes an issue.*
+## GUI
 
-## Areas to revisit
+Web UI bundled into the same docker image. Reads `/v1/openapi.json` for types. Operates on inventory through the same CRUD endpoints the CLI uses. No new architectural commitments.
 
-- **Plugin architecture** (ADR-008) — types vs instances, capability registry, scoped tokens, drift. The end-state model is sketched in the ADR but the V1 cut is intentionally minimal. Revisit before starting V2 to reconfirm direction.
+## Agent manifest signing
 
-## Initial milestones
+Sign the manifest with a long-lived private key on the core. Embed the public key in the bootstrap. Agent verifies the signature before checking the hash. Drop-in over the existing manifest endpoint; closes the trust gap if the core itself is partially compromised.
 
-1. Resolve the remaining open questions above (or accept the leans).
-2. Stand up project skeleton: pyproject, ruff/mypy/pytest config, CI workflows, SQLModel + Alembic with one empty initial migration, `examples/inventory.example.yaml`. Verify "hello world" tests pass on Linux + Windows runners.
-3. Define and write tests for the inventory model (YAML load/validate), state schema (SQLModel + Alembic round-trips), and plugin contract first (TDD).
-4. Implement core API (V1 endpoints) to satisfy the tests.
-5. Build CLI against the API.
-6. Build `windows-pc` agent + installer; Pester tests; manual install on one test PC.
-7. End-to-end test: `docker compose up` + CLI commands + agent on a real PC.
-8. Live with V1 a few weeks before starting V2.
+## YAML import side tool
+
+Optional. A CLI command (`curfew import yaml inventory.yaml`) or external script that reads YAML and POSTs through inventory CRUD. The architecture doesn't depend on it; this is a UX preference.
+
+## Push (long-polling / SSE)
+
+Almost certainly never needed. Pull-based at 60s tick is fine for screentime forever. Listed here for completeness; defer until there's a concrete use case that pull can't satisfy.
+
+---
+
+## Open questions
+
+Implementation-level decisions still pending — none are kernel-architectural:
+
+1. **Plugin agent language for `windows-pc`** — pure PowerShell (zero deps on Windows) or bundled Python (cleaner state logic, requires runtime install)? *Lean: PowerShell for kid PCs to stay dependency-free.*
+2. **Mid-session lock behaviour** — kill running processes immediately, force logoff, or just block future launches? *Lean: kill matching processes (with a config knob to opt out).*
+3. **Initial app list** — Steam, Minecraft, YouTube definite; decide on Roblox, Discord, Twitch.
+4. **CI runners** — public GitHub Actions (free Windows runner) vs. self-hosted on the homelab? *Lean: GitHub Actions until private code or speed becomes an issue.*
+5. **Activity-tracking specifics** (for the budget feature, not the kernel) — timezone for daily/weekly resets, multi-device concurrent-use handling, definition of "recent user input" (OS idle vs. process activity vs. network).
+6. **Audit-log retention policy** — rolling window (90 days?) once the table starts growing.
 
 ## Non-goals (for now)
 
-- macOS, Linux, or non-Windows PC enforcement (will come as plugins; not V1).
+- macOS, Linux, or non-Windows PC enforcement (will come as plugins; not the first plugin).
 - Cloud-account integration (Microsoft Family Safety, Google Family Link).
 - Tamper-resistance against an admin-level kid (assumes kids run as standard Windows users).
-- Real-time push (long-polling / SSE). Pull-only is sufficient through V4; push lands in V5+.
+- Real-time push (long-polling / SSE) — listed as a feature for completeness but no expected need.
 - Multi-tenant / multi-household support.
