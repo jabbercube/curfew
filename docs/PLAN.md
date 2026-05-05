@@ -65,21 +65,21 @@ The schema is created in the initial migration with all fields the system will e
 | `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
 | `device_plugins` | (device, type, config JSON) — plugin types expected to govern this device, with per-instance config (e.g. the Windows local user account `windows-pc` should ACL) |
 | `core_plugins` | (type, instance_id, governs JSON list, config JSON) — in-core plugins. `governs` is a list of user names this instance covers, or `["*"]` for all governed users (e.g. `adguard` with `governs: ["*"]`) |
-| `plugin_instances` | name (PK, e.g. `windows-pc:gamingrig`), type, last_heartbeat, last_seen_version. Derived from `device_plugins` ∪ `core_plugins`: rows are created and deleted in the same transaction as the inventory row. Holds runtime state; inventory holds desired state |
+| `plugin_instances` | name (PK, e.g. `windows-pc:gamingrig`), type, last_heartbeat, last_seen_version. Derived from `device_plugins` ∪ `core_plugins`: rows are created and deleted in the same transaction as the assignment row. Holds runtime state; the assignment tables hold desired state |
 | `plugin_tokens` | token_hash (PK), instance, created_at, revoked_at |
 | `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
 | `audit_log` | id (PK), actor, action, target, payload (JSON), occurred_at |
 | `manifests` | type (PK), version, sha256, agent_url — versioned agent artifacts |
 
-### Inventory data model — concepts
+### Data model — concepts
 
 **Users** are anyone in the household curfew touches. Two independent axes: `role` (`member` / `manager` / `admin`) determines what a user can do; `managed` (bool) determines whether lock rules apply to them. Schedules and budgets attach to managed users — one user with one PC and one tablet shares one daily budget across both.
 
 | Field | Why it matters |
 |-------|----------------|
 | `name` | Stable identifier used in CLI/API/UI. Short string (`kid1`), not a real name. |
-| `role` | `member`, `manager`, or `admin`. Capabilities are cumulative: `member` has no operator powers; `manager` can lock/unlock managed users; `admin` is everything `manager` is plus can edit users, devices, apps, plugin assignments, and agent manifests. Future auth/RBAC keys off this. |
-| `managed` | Bool, defaults to `true`. Whether lock rules apply to this user. Independent of `role` — a teen `manager` could be `managed: true` (has lock control over siblings *and* their own rules apply); a houseguest could be `member, managed: false` (no powers, not subject to rules). When `false`, `GET /v1/users/{user}/status` always returns `{locked: false, reasons: []}` and the rule pipeline is skipped. Operators typically opt out (`--managed false`) for managers, admins, and guests. |
+| `role` | `member`, `manager`, or `admin`. Capabilities are cumulative: `member` has no operator powers; `manager` can lock/unlock any user with `managed: true` (including themselves and other managers); `admin` is everything `manager` is plus can edit users, devices, apps, plugin assignments, and agent manifests. Future auth/RBAC keys off this. |
+| `managed` | Bool, defaults to `true`. Whether lock rules apply to this user. Independent of `role` — a teen `manager` could be `managed: true` (has lock control over siblings *and* their own rules apply); a houseguest could be `member, managed: false` (no powers, not subject to rules). When `false`, `GET /v1/users/{user}/status` always returns `{locked: false, reasons: []}` and the rule pipeline is skipped. Operators typically opt out (`--managed false`) for adult managers and admins, and for guests; a teen `manager` who's also subject to rules stays `managed: true`. |
 | `target_apps` | Apps that get blocked when this user is in a locked state (manual lock today; out-of-schedule and budget-exhausted in later phases). References keys in `apps`. |
 | `schedule` | Optional schedule expression (e.g. `"weekday 16:00-20:00"`). Read by the schedule-lock feature when registered. |
 | `budget_minutes` | Optional daily/weekly budget. Read by the budget-lock feature when registered. |
@@ -93,7 +93,7 @@ The schema is created in the initial migration with all fields the system will e
 | `type` | `pc | laptop | phone | tablet | console | tv`. Constrains which plugin types apply. |
 | `os` | `windows | macos | linux | ios | android`. Selects per-device plugin variants. |
 | `mac` | Network-layer identity, stable across IP changes. List, since a device commonly has multiple MACs (Wi-Fi + ethernet; randomized per network). Read by network-side plugins. |
-| `managed` | Whether curfew governs this device at all. Lets the inventory list devices for completeness without putting them under policy (e.g. a manager's laptop tracked but not enforced). |
+| `managed` | Whether curfew governs this device at all. Lets devices be tracked for completeness without being put under policy (e.g. a manager's laptop tracked but not enforced). |
 
 **Why people *and* devices, not just users-with-a-list-of-devices:**
 
@@ -101,7 +101,7 @@ The schema is created in the initial migration with all fields the system will e
 - Plugin coverage is **per-device** — DNS for the phone, OS-level lock for the PC. Different plugins, same person.
 - A device may change hands (hand-me-down PC) and its `owner` updates without rewriting policy.
 
-**Out of scope for inventory** (deliberately excluded):
+**Out of scope** (deliberately excluded from the data model):
 
 - VLAN / network segmentation — a network concern, not a screentime one.
 - Static-vs-dynamic IP — irrelevant; we key on MAC.
@@ -122,7 +122,7 @@ Every additional lock condition (schedule, budget, shared-device, future per-dev
 
 ## Plugin instance lifecycle
 
-A *plugin instance* is the runtime entity. Instances are declared in inventory:
+A *plugin instance* is the runtime entity. Instances are declared by rows in the assignment tables:
 
 - **Per-device plugins**: each `device_plugins(device, type)` row produces an instance named `<type>:<device>` (e.g. `windows-pc:gamingrig`).
 - **In-core plugins**: each `core_plugins(type, instance_id)` row produces an instance named `<type>` if singular, or `<type>:<instance_id>` if multiple (e.g. `adguard`, or `smart-plug:livingroom`).
@@ -131,12 +131,12 @@ Each plugin type registers a **capability descriptor** at core startup, declarin
 
 Lifecycle:
 
-1. Operator adds the inventory entry (`curfew plugin assign windows-pc gamingrig`). The core derives the instance name (`windows-pc:gamingrig`) and creates the matching `plugin_instances` row in the same transaction.
+1. Operator adds the assignment row (`curfew plugin assign windows-pc gamingrig`). The core derives the instance name (`windows-pc:gamingrig`) and creates the matching `plugin_instances` row in the same transaction.
 2. Operator mints a per-instance bearer token (`curfew plugin token mint windows-pc:gamingrig`). Returns `{id, secret}`; the secret is shown once and never stored in plaintext, the id is what subsequent operations key on (revoke, list).
 3. For per-device plugins: operator runs the bootstrap one-liner on the device with the secret. The bootstrap fetches the agent via the versioned manifest (see below).
 4. Plugin heartbeats every tick (`POST /v1/plugins/{instance}/heartbeat`).
-5. Core compares expected instances (from inventory) to actual heartbeats; surfaces drift on `GET /v1/plugins`.
-6. Removal: delete the inventory entry → `plugin_instances` row deleted in the same transaction → core revokes outstanding tokens → next agent tick gets 401 → operator runs uninstall on the device.
+5. Core compares expected instances (derived from the assignment tables) to actual heartbeats; surfaces drift on `GET /v1/plugins`.
+6. Removal: delete the assignment row → `plugin_instances` row deleted in the same transaction → core revokes outstanding tokens → next agent tick gets 401 → operator runs uninstall on the device.
 
 ## Agent update integrity
 
@@ -184,7 +184,7 @@ Pydantic v2 schemas everywhere. OpenAPI auto-emitted at `/v1/openapi.json`. CLI 
 ## API surface (kernel)
 
 ```
-Inventory CRUD
+User / device / app CRUD
   GET    /v1/users                              list
   GET    /v1/users/{user}                       fetch
   POST   /v1/users                              create
@@ -207,7 +207,7 @@ Plugin lifecycle
   GET    /v1/plugins                            expected instances + heartbeat status (drift)
   GET    /v1/plugins/types                      registered types + capability descriptors
   POST   /v1/plugins/assignments                body { type, target } where target is a device name or "core/{instance_id}"; returns { instance, ... } with derived name
-  DELETE /v1/plugins/assignments/{instance}     remove instance from inventory
+  DELETE /v1/plugins/assignments/{instance}     remove the assignment row
   POST   /v1/plugins/{instance}/tokens          mint a bearer token; returns { id, secret } — secret shown once
   DELETE /v1/plugins/{instance}/tokens/{id}     revoke
   GET    /v1/plugins/{instance}/tokens          list active token ids (no secrets)
@@ -218,7 +218,7 @@ Locks
   POST   /v1/users/{user}/lock                  manual lock
   POST   /v1/users/{user}/unlock                manual unlock
 
-Effective state
+Lock status
   GET    /v1/users/{user}/status                { locked: bool, reasons: [{kind, ...}] }
   GET    /v1/devices/{device}/status            { locked: bool, reasons: [{kind, ...}] } — empty pipeline in kernel
 
@@ -268,7 +268,8 @@ curfew/
 │   ├── unit/                         # models, schemas, rule pipeline, SDK
 │   ├── api/                          # FastAPI TestClient integration tests
 │   ├── cli/                          # CLI against a mocked or real API
-│   └── e2e/                          # docker-compose-up + CLI roundtrip + reference plugin
+│   ├── reftest/                      # reference test plugin (Python SDK consumer)
+│   └── e2e/                          # docker-compose-up + CLI roundtrip + reftest
 ├── docker/
 │   ├── Dockerfile
 │   └── compose.yml
@@ -286,7 +287,7 @@ curfew/
 
 | Layer | Framework | What's covered |
 |-------|-----------|----------------|
-| Inventory + state models | pytest + in-memory SQLite | CRUD round-trips, schema validation, migrations apply forward, FK/uniqueness behaviour. ≥90% coverage. |
+| Schema models | pytest + in-memory SQLite | CRUD round-trips, schema validation, migrations apply forward, FK/uniqueness behaviour. ≥90% coverage. |
 | Rule pipeline | pytest | Rule registration, OR composition, reasons aggregation, behaviour with zero rules. |
 | Plugin contract | pytest with a fake plugin | Reference test plugin exercises the full contract; serves as living documentation. |
 | Plugin SDK (Python) | pytest | Polling loop, heartbeat retry, manifest fetch, hash mismatch refusal. |
@@ -307,7 +308,7 @@ Pre-commit hooks for lint/format. Type hints required (`mypy --strict` for the c
 
 The kernel is "done" when this end-to-end walkthrough passes against the **reference test plugin** (a no-op SDK consumer in the test suite that heartbeats, observes lock-status changes, and writes a sentinel file when locked). The reference plugin exercises the kernel end-to-end without depending on any feature-level plugin.
 
-1. CLI creates a user (`curfew user add kid1 --role member --managed true`), a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`), and an app (`curfew app add steam --exe-path ...`).
+1. CLI creates a user (`curfew user add kid1 --role member`), a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`), and an app (`curfew app add steam --exe-path ...`).
 2. CLI publishes the reference plugin's first version (`curfew agent publish reftest 1.0.0 ./reftest.py`).
 3. CLI assigns the reference plugin to the device (`curfew plugin assign reftest gamingrig`); verify the `plugin_instances` row was created in the same transaction.
 4. CLI mints a token (`curfew plugin token mint reftest:gamingrig`); CLI prints the secret once and the bootstrap one-liner.
@@ -361,7 +362,7 @@ Each plugin is a new type with: a capability descriptor, an SDK consumer (Python
 
 ## GUI
 
-Web UI bundled into the same docker image. Reads `/v1/openapi.json` for types. Operates on inventory through the same CRUD endpoints the CLI uses. No new architectural commitments.
+Web UI bundled into the same docker image. Reads `/v1/openapi.json` for types. Calls the same CRUD endpoints the CLI uses. No new architectural commitments.
 
 ## Agent manifest signing
 
@@ -369,7 +370,7 @@ Sign the manifest with a long-lived private key on the core. Embed the public ke
 
 ## YAML import side tool
 
-Optional. A CLI command (`curfew import yaml inventory.yaml`) or external script that reads YAML and POSTs through inventory CRUD. The architecture doesn't depend on it; this is a UX preference.
+Optional. A CLI command (`curfew import yaml config.yaml`) or external script that reads a YAML config file and POSTs through the user/device/app CRUD endpoints. The architecture doesn't depend on it; this is a UX preference.
 
 ## Push (long-polling / SSE)
 
@@ -381,11 +382,11 @@ Almost certainly never needed. Pull-based at 60s tick is fine for screentime for
 
 Implementation-level decisions still pending — none are kernel-architectural:
 
-1. **Plugin agent language for `windows-pc`** — pure PowerShell (zero deps on Windows) or bundled Python (cleaner state logic, requires runtime install)? *Lean: PowerShell for kid PCs to stay dependency-free.*
+1. **Plugin agent language for `windows-pc`** — pure PowerShell (zero deps on Windows) or bundled Python (cleaner state logic, requires runtime install)? *Lean: PowerShell for managed PCs to stay dependency-free.*
 2. **Mid-session lock behaviour** — kill running processes immediately, force logoff, or just block future launches? *Lean: kill matching processes (with a config knob to opt out).*
 3. **Initial app list** — Steam, Minecraft, YouTube definite; decide on Roblox, Discord, Twitch.
 4. **CI runners** — public GitHub Actions (free Windows runner) vs. self-hosted on the homelab? *Lean: GitHub Actions until private code or speed becomes an issue.*
-5. **Activity-tracking specifics** (for the budget feature, not the kernel) — timezone for daily/weekly resets, multi-device concurrent-use handling, definition of "recent user input" (OS idle vs. process activity vs. network).
+5. **Time handling** — timezone for schedule evaluation, daily/weekly budget resets, and audit-log timestamps. Plus activity-tracking specifics for the budget feature: multi-device concurrent-use handling, definition of "recent user input" (OS idle vs. process activity vs. network).
 6. **Audit-log retention policy** — rolling window (90 days?) once the table starts growing.
 
 ## Non-goals (for now)

@@ -19,11 +19,11 @@ Library-first remains the right call only if the project ever scopes back to ter
 
 ## ADR-002: SQLite is the only persistent store
 
-**Decided:** all persistent data — inventory, runtime state, tokens, audit log, agent manifests — lives in a single `state.sqlite` file. SQLModel for the schema, Alembic for migrations from day one.
+**Decided:** all persistent data — users, devices, apps, plugin assignments, runtime state, tokens, audit log, agent manifests — lives in a single `state.sqlite` file. SQLModel for the schema, Alembic for migrations from day one.
 
 **Rejected:**
 
-- **Multi-store split (e.g. YAML inventory + SQLite runtime).** Felt natural early on — inventory is human-edited, runtime is machine-written, different lifecycles. Breaks down the moment a CLI or GUI tries to write inventory: YAML round-tripping that preserves comments and ordering is fragile, and bidirectional sync between YAML and a runtime store is famously hard. Cleaner to put everything in SQLite and offer YAML as an *optional client-side import tool* if anyone wants it (just another HTTP client of the inventory CRUD endpoints).
+- **Multi-store split (e.g. YAML data + SQLite runtime).** Felt natural early on — human-edited records (users, devices, apps) and machine-written runtime have different lifecycles. Breaks down the moment a CLI or GUI tries to write: YAML round-tripping that preserves comments and ordering is fragile, and bidirectional sync between YAML and a runtime store is famously hard. Cleaner to put everything in SQLite and offer YAML as an *optional client-side import tool* if anyone wants it (just another HTTP client of the user/device/app CRUD endpoints).
 - **Postgres.** Overkill for a homelab single-tenant store. Adds an operational dependency.
 - **JSON file.** Concurrency-unsafe with multiple writers. Schema-less, so every change is a custom migration loader.
 
@@ -36,7 +36,7 @@ Library-first remains the right call only if the project ever scopes back to ter
 
 ## ADR-003: Pull-based plugin reconciliation
 
-**Decided:** plugins poll the API on a timer (default 60s) and reconcile their slice of state. Push (long-polling / SSE) is not planned.
+**Decided:** plugins poll the API on a timer (default 60s) and reconcile their slice of state. Push (long-polling / SSE) is not planned for MVP.
 
 **Why:**
 
@@ -51,7 +51,7 @@ Library-first remains the right call only if the project ever scopes back to ter
 **Rejected:**
 
 - **MSI / proper installer** — overkill for a homelab with a handful of PCs.
-- **Group Policy / Intune / MDM** — requires AD or cloud MDM the homelab doesn't run.
+- **Group Policy / Intune / MDM** — requires AD or cloud MDM the homelab typically doesn't run.
 - **Manual copy + manual scheduled task setup** — fine for one PC, doesn't scale.
 
 **Why bootstrap won:** zero new infrastructure (the bootstrap and agent live behind the same Traefik that serves the API), one-time per device, idiomatic for the scale, self-healing updates via ADR-009.
@@ -68,24 +68,24 @@ Library-first remains the right call only if the project ever scopes back to ter
 
 ## ADR-006: Per-instance bearer tokens
 
-**Decided:** each plugin instance gets its own bearer token. A second `windows-pc:laptop2` would have a separate token from `windows-pc:gamingrig`. Tokens are hashed at rest in the `plugin_tokens` table.
+**Decided:** each instance gets its own bearer token. A second `windows-pc:laptop2` would have a separate token from `windows-pc:gamingrig`. Tokens are hashed at rest in the `plugin_tokens` table.
 
 **Why:** revoke a single compromised PC without nuking the rest; log which instance made which call.
 
 **Read-scope tightening** — making a `windows-pc:gamingrig` token only able to read `kid1`'s slice of state, not all state — is a future feature on top of the kernel. Issuance is per-instance from day one; scoping is later.
 
-## ADR-007: Inventory declares expected plugin instances
+## ADR-007: Plugin-assignment tables declare expected instances
 
-**Decided:** the inventory tables (`device_plugins` for per-device, `core_plugins` for in-core) are the source of truth for which plugin instances *should* exist. Plugin heartbeats record what *actually* checked in. The core compares the two and surfaces drift on `GET /v1/plugins`.
+**Decided:** the plugin-assignment tables (`device_plugins` for per-device, `core_plugins` for in-core) are the source of truth for which plugin instances *should* exist. Plugin heartbeats record what *actually* checked in. The core compares the two and surfaces drift on `GET /v1/plugins`.
 
-**`plugin_instances` is a derived projection.** Rows are created and deleted in the same transaction as the inventory row. The table holds runtime fields (`last_heartbeat`, `last_seen_version`); the inventory tables hold desired state. There is no path where one exists without the other — no drift between "what's declared" and "what the runtime tracks."
+**`plugin_instances` is a derived projection.** Rows are created and deleted in the same transaction as the assignment row. The table holds runtime fields (`last_heartbeat`, `last_seen_version`); the assignment tables hold desired state. There is no path where one exists without the other — no drift between "what's declared" and "what the runtime tracks."
 
 **Rejected:**
 
-- **Pure plugin-driven** (plugin announces itself on first heartbeat; inventory has no plugin assignment). Loses the ability to distinguish "agent broken" from "agent uninstalled" — both look like silence.
-- **Pure inventory-driven** (declared in inventory, no heartbeats). Loses liveness signal entirely.
+- **Pure plugin-driven** (plugin announces itself on first heartbeat; nothing in the database declares the assignment). Loses the ability to distinguish "agent broken" from "agent uninstalled" — both look like silence.
+- **Pure declarative** (declared in the assignment tables, no heartbeats). Loses liveness signal entirely.
 
-**Symmetric for in-core and per-device plugins:** both are inventory entries with config, both produce heartbeats, both surface drift the same way. The contract doesn't care where the agent runs. In-core entries (`core_plugins`) carry an explicit `governs` field — a list of users covered, or `["*"]` for all governed users. Per-device entries (`device_plugins`) inherit their user from the device's `owner` (or operate at device scope when `owner` is null).
+**Symmetric for in-core and per-device plugins:** both are rows in their respective assignment tables with config, both produce heartbeats, both surface drift the same way. The contract doesn't care where the agent runs. In-core entries (`core_plugins`) carry an explicit `governs` field — a list of users covered, or `["*"]` for all governed users. Per-device entries (`device_plugins`) inherit their user from the device's `owner` (or operate at device scope when `owner` is null).
 
 ## ADR-008: Lock status is a scoped rule pipeline
 
@@ -115,7 +115,7 @@ Rules implement a single interface, declare their scope at registration, and ret
 
 **Decided:** agents fetch their code via a manifest endpoint (`GET /v1/agents/{type}/manifest` → `{version, sha256, url}`). The agent verifies the SHA-256 of the fetched artifact matches the manifest before swapping atomically. Update checks happen on a slow tick (default hourly); state polling on the fast tick (default 60s).
 
-**Rejected:** "fetch latest `agent.ps1` every minute and execute." Trivially exploitable: anyone who controls the core's static-file path (or MITMs HTTPS without certificate pinning) gets remote code execution on every kid PC, with whatever privileges the agent runs at — admin-equivalent for `windows-pc` (it modifies NTFS ACLs and registry).
+**Rejected:** "fetch latest `agent.ps1` every minute and execute." Trivially exploitable: anyone who controls the core's static-file path (or MITMs HTTPS without certificate pinning) gets remote code execution on every managed PC, with whatever privileges the agent runs at — admin-equivalent for `windows-pc` (it modifies NTFS ACLs and registry).
 
 **Why this is a kernel commitment, not a feature:**
 
