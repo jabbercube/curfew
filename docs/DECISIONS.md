@@ -58,13 +58,13 @@ Library-first remains the right call only if the project ever scopes back to ter
 
 ## ADR-005: Plugin contract — poll, reconcile, heartbeat
 
-**Decided:** a plugin authenticates with a per-instance bearer (ADR-006), reads its scoped state (`GET /v1/state/effective/{user}` or filtered variants), reconciles its slice of the world to match, and `POST`s a heartbeat each tick. Optionally `POST`s an activity ping when there's recent user input (consumed by the budget feature when registered).
+**Decided:** a plugin authenticates with a per-instance bearer (ADR-006), reads its scoped lock status (`GET /v1/users/{user}/status` or `GET /v1/devices/{device}/status`), reconciles its slice of the world to match, and `POST`s a heartbeat each tick. May also `POST` an activity ping with `{user, occurred_at}` when it observes recent user input. The activity endpoint is always available; whether the core does anything with the data depends on whether a rule reads it (currently only the budget feature when registered). Plugins that can't observe user input simply don't call it.
 
 **Why minimal:**
 
 - Lets in-core plugins (`adguard`, `smart-plug`) and per-device plugins (`windows-pc`) share the same contract — deployment differs, contract doesn't.
 - New plugin = new SDK consumer + reconcile logic. Nothing in the core changes.
-- Schedule and budget evaluation live in the *core* as rules (ADR-008), not in plugins. Plugins stay dumb — they see only `effective_lock: bool` and a `reasons` list, no understanding of why.
+- Schedule and budget evaluation live in the *core* as rules (ADR-008), not in plugins. Plugins stay dumb — they see only `{locked, reasons}` and don't need to understand why.
 
 ## ADR-006: Per-instance bearer tokens
 
@@ -78,25 +78,38 @@ Library-first remains the right call only if the project ever scopes back to ter
 
 **Decided:** the inventory tables (`device_plugins` for per-device, `core_plugins` for in-core) are the source of truth for which plugin instances *should* exist. Plugin heartbeats record what *actually* checked in. The core compares the two and surfaces drift on `GET /v1/plugins`.
 
+**`plugin_instances` is a derived projection.** Rows are created and deleted in the same transaction as the inventory row. The table holds runtime fields (`last_heartbeat`, `last_seen_version`); the inventory tables hold desired state. There is no path where one exists without the other — no drift between "what's declared" and "what the runtime tracks."
+
 **Rejected:**
 
 - **Pure plugin-driven** (plugin announces itself on first heartbeat; inventory has no plugin assignment). Loses the ability to distinguish "agent broken" from "agent uninstalled" — both look like silence.
 - **Pure inventory-driven** (declared in inventory, no heartbeats). Loses liveness signal entirely.
 
-**Symmetric for in-core and per-device plugins:** both are inventory entries with config, both produce heartbeats, both surface drift the same way. The contract doesn't care where the agent runs.
+**Symmetric for in-core and per-device plugins:** both are inventory entries with config, both produce heartbeats, both surface drift the same way. The contract doesn't care where the agent runs. In-core entries (`core_plugins`) carry an explicit `governs` field — a list of users covered, or `["*"]` for all governed users. Per-device entries (`device_plugins`) inherit their user from the device's `owner` (or operate at device scope when `owner` is null).
 
-## ADR-008: Effective state is a rule pipeline
+## ADR-008: Lock status is a scoped rule pipeline
 
-**Decided:** `GET /v1/state/effective/{user}` returns `{locked: bool, reasons: [...]}`. The `locked` value is the OR of registered rule outputs; the `reasons` array names which rules fired. Rules implement a single interface and register at startup.
+**Decided:** the kernel computes lock status per scope. Two scopes ship from day one:
 
-**Rejected:** hardcoded if/else in the lock computation. Each new feature would touch the central function and create regression risk; the call signature and response shape would drift as features arrive.
+- **User scope**: `GET /v1/users/{user}/status` returns `{locked, reasons}` for that user.
+- **Device scope**: `GET /v1/devices/{device}/status` returns the same shape for a device (used by the shared-device-lock feature and any future device-only locking semantics).
 
-**Why a pipeline:**
+Rules implement a single interface, declare their scope at registration, and return zero or one reason. `locked` is the OR of registered rule outputs in that scope; `reasons` is the array of structured reason objects that fired.
 
-- Every new lock condition (schedule, budget, shared-device) is a new rule registered into the same machinery. No API or schema reshape.
+**Reasons are structured objects, not strings:** `{kind: "manual_lock"}`, `{kind: "budget_exhausted", consumed: 120, budget: 90}`. Adding detail to a reason kind is a non-breaking change. Clients render `kind` and ignore unknown fields.
+
+**Rejected:**
+
+- **Hardcoded if/else.** Touches one central function for every new feature; regression risk per change. Call signature and response shape drift as features arrive.
+- **Single-scope (user-only) pipeline.** Forces the shared-device-lock feature to add a new endpoint anyway, breaking the "features are pure additions" promise.
+- **String reasons.** Either you encode detail inside the string and parse it, or you migrate to structured later. Pay once now.
+
+**Why a scoped pipeline:**
+
+- Every new lock condition (schedule, budget, shared-device, future per-device locks) registers a rule into the right scope. No API surface changes; no central code to touch.
 - Plugins always see the same response shape regardless of which rules are registered. They don't need to know schedule expressions or budget math exist.
-- The `reasons` array makes "why is this user locked?" trivially observable in the UI and the audit log.
-- Tests for one rule don't entangle with another.
+- The `reasons` array makes "why is this user (or device) locked?" trivially observable in UI and audit log.
+- Rule tests don't entangle with each other.
 
 ## ADR-009: Agent updates are versioned and hash-verified
 
@@ -114,7 +127,7 @@ Library-first remains the right call only if the project ever scopes back to ter
 
 ## ADR-010: A plugin SDK is part of the kernel
 
-**Decided:** the kernel ships a Python SDK (`curfew_plugin_sdk`) and a PowerShell module (`curfew-plugin.psm1`) that handle polling, heartbeating, retry/backoff, hash-verified self-update, and error reporting. A plugin's business logic is the reconciler — given the effective state, do the right thing. The SDK handles everything else.
+**Decided:** the kernel ships a Python SDK (`curfew_plugin_sdk`) and a PowerShell module (`curfew-plugin.psm1`) that handle polling, heartbeating, retry/backoff, hash-verified self-update, and error reporting. A plugin's business logic is the reconciler — given the lock status, do the right thing. The SDK handles everything else.
 
 **Rejected:** each plugin rolls its own loop.
 

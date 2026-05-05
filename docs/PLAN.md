@@ -63,9 +63,9 @@ The schema is created in the initial migration with all fields the system will e
 | `users` | name (PK), role, target_apps (JSON list), schedule (JSON expr, nullable), budget_minutes (int, nullable) |
 | `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
 | `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
-| `device_plugins` | (device, type) — plugin types expected to govern this device |
-| `core_plugins` | (type, instance_id, config JSON) — in-core plugins (e.g. `adguard` governing all kids) |
-| `plugin_instances` | name (PK, e.g. `windows-pc:gamingrig`), type, last_heartbeat, last_seen_version |
+| `device_plugins` | (device, type, config JSON) — plugin types expected to govern this device, with per-instance config (e.g. the Windows local user account `windows-pc` should ACL) |
+| `core_plugins` | (type, instance_id, governs JSON list, config JSON) — in-core plugins. `governs` is a list of user names this instance covers, or `["*"]` for all governed users (e.g. `adguard` with `governs: ["*"]`) |
+| `plugin_instances` | name (PK, e.g. `windows-pc:gamingrig`), type, last_heartbeat, last_seen_version. Derived from `device_plugins` ∪ `core_plugins`: rows are created and deleted in the same transaction as the inventory row. Holds runtime state; inventory holds desired state |
 | `plugin_tokens` | token_hash (PK), instance, created_at, revoked_at |
 | `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
 | `audit_log` | id (PK), actor, action, target, payload (JSON), occurred_at |
@@ -79,7 +79,7 @@ The schema is created in the initial migration with all fields the system will e
 |-------|----------------|
 | `name` | Stable identifier used in CLI/API/UI. Short string (`kid1`), not a real name. |
 | `role` | `parent` or `child`. Distinguishes who governs from who is governed; future auth/RBAC keys off this. |
-| `target_apps` | Apps that get blocked when this user is in an effective-lock state. References keys in `apps`. |
+| `target_apps` | Apps that get blocked when this user is in a locked state (manual lock today; out-of-schedule and budget-exhausted in later phases). References keys in `apps`. |
 | `schedule` | Optional schedule expression (e.g. `"weekday 16:00-20:00"`). Read by the schedule-lock feature when registered. |
 | `budget_minutes` | Optional daily/weekly budget. Read by the budget-lock feature when registered. |
 
@@ -108,9 +108,16 @@ The schema is created in the initial migration with all fields the system will e
 
 ## Effective-state rule pipeline
 
-`GET /v1/state/effective/{user}` returns `{locked: bool, reasons: [...]}`. The `locked` value is the OR of registered rule outputs; `reasons` names which rules fired.
+The kernel computes lock status per scope. Two scopes ship in the kernel:
 
-Rules implement a single interface and register at startup. The kernel ships with **one rule: `manual_lock`**. Every additional feature (schedule lock, budget lock, shared-device lock) is a new rule registered into the same pipeline — no API or schema reshape, no central if/else to edit.
+- **User scope** — `GET /v1/users/{user}/status` returns `{locked: bool, reasons: [...]}`. The OR of registered user-scope rules.
+- **Device scope** — `GET /v1/devices/{device}/status` returns the same shape for a device. The OR of registered device-scope rules. Empty until any device-scope rule registers (the shared-device-lock feature is the first).
+
+Rules implement a single interface, declare their scope at registration, and return zero or one reason. The kernel ships with **one rule: `manual_lock`** (user scope).
+
+**Reasons are structured objects, not strings:** `{kind: "manual_lock"}`, `{kind: "out_of_schedule"}`, `{kind: "budget_exhausted", consumed: 120, budget: 90}`. Clients render `kind` and ignore unknown fields. Adding detail to a reason is a non-breaking change.
+
+Every additional lock condition (schedule, budget, shared-device, future per-device locks) is a new rule registered into the right scope's pipeline. No API surface changes, no central if/else to edit.
 
 ## Plugin instance lifecycle
 
@@ -123,12 +130,12 @@ Each plugin type registers a **capability descriptor** at core startup, declarin
 
 Lifecycle:
 
-1. Operator adds the inventory entry (`curfew plugin assign windows-pc gamingrig`).
-2. Operator mints a per-instance bearer token (`curfew plugin token mint windows-pc:gamingrig`). Hashed at rest.
-3. For per-device plugins: operator runs the bootstrap one-liner on the device with the token. The bootstrap fetches the agent via the versioned manifest (see below).
+1. Operator adds the inventory entry (`curfew plugin assign windows-pc gamingrig`). The core derives the instance name (`windows-pc:gamingrig`) and creates the matching `plugin_instances` row in the same transaction.
+2. Operator mints a per-instance bearer token (`curfew plugin token mint windows-pc:gamingrig`). Returns `{id, secret}`; the secret is shown once and never stored in plaintext, the id is what subsequent operations key on (revoke, list).
+3. For per-device plugins: operator runs the bootstrap one-liner on the device with the secret. The bootstrap fetches the agent via the versioned manifest (see below).
 4. Plugin heartbeats every tick (`POST /v1/plugins/{instance}/heartbeat`).
 5. Core compares expected instances (from inventory) to actual heartbeats; surfaces drift on `GET /v1/plugins`.
-6. Removal: delete the inventory entry → core revokes the token → next agent tick gets 401 → operator runs uninstall on the device.
+6. Removal: delete the inventory entry → `plugin_instances` row deleted in the same transaction → core revokes outstanding tokens → next agent tick gets 401 → operator runs uninstall on the device.
 
 ## Agent update integrity
 
@@ -156,7 +163,9 @@ Both expose:
 - Error reporting back to core (via heartbeat payload)
 - Config bootstrap (instance name, API URL, token)
 
-A plugin's business logic is the **reconciler** — given the effective state, do the right thing. The SDK handles everything else. windows-pc is the first SDK consumer and stress-tests the contract.
+A plugin's business logic is the **reconciler** — given the lock status, do the right thing. The SDK handles everything else.
+
+The kernel also ships a **reference test plugin** — a no-op SDK consumer that heartbeats, observes lock-status changes, and writes a sentinel file when locked. The reference plugin lives in the test suite, exercises the SDK end-to-end, and is what the kernel acceptance test runs against. windows-pc is the first non-trivial SDK consumer (a feature on top of the kernel).
 
 ## Authentication
 
@@ -196,26 +205,29 @@ Inventory CRUD
 Plugin lifecycle
   GET    /v1/plugins                            expected instances + heartbeat status (drift)
   GET    /v1/plugins/types                      registered types + capability descriptors
-  POST   /v1/plugins/assignments                add instance to inventory
+  POST   /v1/plugins/assignments                body { type, target } where target is a device name or "core/{instance_id}"; returns { instance, ... } with derived name
   DELETE /v1/plugins/assignments/{instance}     remove instance from inventory
-  POST   /v1/plugins/{instance}/tokens          mint a bearer token (returns the secret once)
+  POST   /v1/plugins/{instance}/tokens          mint a bearer token; returns { id, secret } — secret shown once
   DELETE /v1/plugins/{instance}/tokens/{id}     revoke
+  GET    /v1/plugins/{instance}/tokens          list active token ids (no secrets)
   POST   /v1/plugins/{instance}/heartbeat       liveness (called by the agent)
-  POST   /v1/plugins/{instance}/activity        activity tick (no-op until budget rule registered)
+  POST   /v1/plugins/{instance}/activity        body { user, occurred_at, ... }; no-op until budget rule registered
 
 Locks
   POST   /v1/users/{user}/lock                  manual lock
   POST   /v1/users/{user}/unlock                manual unlock
 
 Effective state
-  GET    /v1/state                              full snapshot (admin)
-  GET    /v1/state/effective/{user}             { locked: bool, reasons: [...] }
+  GET    /v1/users/{user}/status                { locked: bool, reasons: [{kind, ...}] }
+  GET    /v1/devices/{device}/status            { locked: bool, reasons: [{kind, ...}] } — empty pipeline in kernel
 
 Agent updates
   GET    /v1/agents/{type}/manifest             { version, sha256, url }
   GET    /v1/agents/{type}/{version}            agent artifact (the agent.ps1 / .py / .sh)
+  POST   /v1/agents/{type}/versions             publish a new agent version: body { version, artifact }; rotates the manifest pointer to it
 
-Health
+Admin
+  GET    /v1/admin/snapshot                     full system snapshot (debug; not the primary read path)
   GET    /v1/health                             liveness probe
 ```
 
@@ -227,10 +239,12 @@ curfew device      add | list | show | edit | rm
 curfew app         add | list | show | edit | rm
 curfew plugin      assign | unassign | types | list | drift
 curfew plugin token  mint | revoke | list
+curfew agent       publish <type> <version> <file>
 curfew lock        <user>
 curfew unlock      <user>
 curfew status                                # human-readable summary
-curfew status --json                         # machine-readable
+
+# Convention: every list/show/status command accepts --json for machine-readable output.
 ```
 
 ## Repository layout
@@ -290,18 +304,22 @@ Pre-commit hooks for lint/format. Type hints required (`mypy --strict` for the c
 
 ## Acceptance: kernel done
 
-The kernel is "done" when this end-to-end walkthrough passes:
+The kernel is "done" when this end-to-end walkthrough passes against the **reference test plugin** (a no-op SDK consumer in the test suite that heartbeats, observes lock-status changes, and writes a sentinel file when locked). The reference plugin exercises the kernel end-to-end without depending on any feature-level plugin.
 
 1. CLI creates a user (`curfew user add kid1 --role child`), a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`), and an app (`curfew app add steam --exe-path ...`).
-2. CLI assigns the windows-pc plugin to the device (`curfew plugin assign windows-pc gamingrig`).
-3. CLI mints a token (`curfew plugin token mint windows-pc:gamingrig`) and prints a bootstrap one-liner.
-4. windows-pc agent on a real PC runs the bootstrap. The bootstrap fetches the manifest, verifies the SHA-256, installs the agent, registers the scheduled task.
-5. Agent heartbeats; `GET /v1/plugins` shows it healthy.
-6. Stop the agent; `GET /v1/plugins` shows drift within 2 ticks.
-7. CLI locks the user (`curfew lock kid1`); the manual_lock rule fires; `GET /v1/state/effective/kid1` returns `{locked: true, reasons: ["manual_lock"]}`.
-8. Agent reads the effective state, kills matching processes, applies ACLs.
-9. CLI unlocks; agent reverses.
-10. `audit_log` table contains a structured row for every API write in the sequence.
+2. CLI publishes the reference plugin's first version (`curfew agent publish reftest 1.0.0 ./reftest.py`).
+3. CLI assigns the reference plugin to the device (`curfew plugin assign reftest gamingrig`); verify the `plugin_instances` row was created in the same transaction.
+4. CLI mints a token (`curfew plugin token mint reftest:gamingrig`); CLI prints the secret once and the bootstrap one-liner.
+5. The reference plugin runs the bootstrap. The bootstrap fetches the manifest, verifies SHA-256, installs the plugin.
+6. Plugin heartbeats; `GET /v1/plugins` shows it healthy.
+7. Stop the plugin; `GET /v1/plugins` shows drift within 2 ticks.
+8. CLI locks the user (`curfew lock kid1`); the manual_lock rule fires; `GET /v1/users/kid1/status` returns `{locked: true, reasons: [{kind: "manual_lock"}]}`.
+9. The reference plugin reads the lock status and writes its sentinel file.
+10. CLI unlocks; the reference plugin clears its sentinel.
+11. CLI removes the assignment (`curfew plugin unassign reftest:gamingrig`); the `plugin_instances` row is deleted, outstanding tokens are revoked, the next heartbeat gets 401.
+12. `audit_log` contains a structured row for every API write in the sequence.
+
+windows-pc lands as the first real feature immediately after the kernel passes — same lifecycle, but with NTFS ACLs and process kill replacing the sentinel file.
 
 ---
 
@@ -311,23 +329,23 @@ Features stack on top of the kernel without reshaping it. **Order is arbitrary**
 
 ## Manual lock rule (kernel reference)
 
-The first rule registered. Reads `user_locks.manual_lock`; returns `(locked, "manual_lock")` when set. Ships with the kernel as the proof-of-concept rule.
+The first rule registered (user scope). Reads `user_locks.manual_lock`; returns `{kind: "manual_lock"}` when set. Ships with the kernel as the proof-of-concept rule.
 
 ## Schedule lock rule
 
-Reads `users.schedule`; evaluates against current time + timezone; returns `(locked, "out_of_schedule")` when out of window. CLI: `curfew schedule <user> "<expr>"`. Tests: expression parsing, time-zone handling, transitions across midnight/DST.
+A new user-scope rule. Reads `users.schedule`; evaluates against current time + timezone; returns `{kind: "out_of_schedule", schedule: "..."}` when out of window. CLI: `curfew schedule <user> "<expr>"`. Tests: expression parsing, time-zone handling, transitions across midnight/DST.
 
 ## Budget lock rule + activity ingestion
 
-Adds `usage_minutes(user, day, minutes)` table via Alembic migration. Plugins call `POST /v1/plugins/{instance}/activity` (the kernel endpoint that was a no-op) when there's recent user input. Core tallies; budget rule returns `(locked, "budget_exhausted")` when `users.budget_minutes` is consumed. Resets daily/weekly. CLI: `curfew budget <user> <minutes>`.
+Adds `usage_minutes(user, day, minutes)` table via Alembic migration. Plugins call `POST /v1/plugins/{instance}/activity` with `{user, occurred_at}` when they observe recent user input — the kernel endpoint that was a no-op now writes to `usage_minutes`. A new user-scope rule returns `{kind: "budget_exhausted", consumed: 120, budget: 90}` when `users.budget_minutes` is consumed for the period. Resets daily/weekly. CLI: `curfew budget <user> <minutes>`.
 
 ## Shared-device lock + `--shared` operations
 
-Adds a device-level `shared_lock` flag (or a `shared_locks` table). New rule that's evaluated only for shared-device contexts. CLI: `curfew lock --shared` and `curfew unlock --shared`. Endpoints: `POST /v1/shared/lock` / `unlock`.
+A new **device-scope rule** — the first to register into the device-scope pipeline. Adds a device-level `shared_lock` flag (or row). The rule reads it for any device with `owner = NULL` and returns `{kind: "shared_lock"}` when set. CLI: `curfew lock --shared` and `curfew unlock --shared`. Endpoints: `POST /v1/shared/lock` / `unlock`. Plugins on shared devices read `GET /v1/devices/{device}/status`.
 
 ## Per-device app overrides
 
-Adds a `device_app_overrides(device, app, exe_paths, process_names, urls)` table. Resolution path in the core: when a plugin reads effective state for a device, the global app entry is overridden by the device's row if present. **Replace** semantics — override list replaces global list, not merge.
+Adds a `device_app_overrides(device, app, exe_paths, process_names, urls)` table. Resolution path in the core: when a plugin reads the lock status for a device, the global app entry is overridden by the device's row if present. **Replace** semantics — override list replaces global list, not merge.
 
 ## Plugins
 
