@@ -6,7 +6,7 @@ For on-device extensions (programs that run on a kid PC or Mac), see [AGENTS.md]
 
 ## What a plugin is
 
-A plugin is a Python module that extends curfew-core in-process. Drop a folder into `plugins_dir`, restart the core, and curfew imports your code at startup. When state changes for a user the plugin governs, the core calls your `reconcile()` method directly.
+A plugin is a Python module that extends curfew-core in-process. Drop a folder into any directory listed in `CURFEW_PLUGINS_DIRS`, restart the core, and curfew imports your code at startup. When state changes for a user the plugin governs, the core calls your `reconcile()` method directly.
 
 Plugins are how curfew talks to homelab-resident services: AdGuard for DNS sinkhole, Tasmota/Kasa smart plugs for power control, UniFi/OPNsense for router ACLs, Tailscale for tailnet ACLs, plus anything you write yourself (Wyze, IKEA Tradfri, SmartThings, your own tooling).
 
@@ -23,7 +23,7 @@ The split exists because of physics, not preference. A kid PC can't be reached f
 
 ## What a plugin folder looks like
 
-`plugins_dir` (default `/etc/curfew/plugins/`, mounted from a docker volume) holds one subdirectory per plugin type:
+Each entry in `CURFEW_PLUGINS_DIRS` is a directory holding one subdirectory per plugin type. The default value points at the curfew repo's bundled `plugins/` directory inside the docker image — that's where the shipped plugins (`adguard`, `smart_plug`, etc.) live. Operators add more directories (e.g. a mounted `/etc/curfew/plugins/` volume) to install third-party plugins:
 
 ```
 plugins/
@@ -89,15 +89,17 @@ That's the whole plugin. One class, one `reconcile()` method, one `Config`. No H
 
 ### `requirements.txt` (optional)
 
-If your plugin needs pip dependencies, list them. Curfew installs them into a per-plugin sub-environment at startup.
+If your plugin needs pip dependencies, list them. Curfew installs them into curfew-core's shared Python environment at startup.
 
 ```
 httpx>=0.25
 ```
 
+**Heads up — shared environment.** All plugins share curfew-core's Python process and its installed packages. There's no per-plugin dependency isolation (Python can't really do that in one process). If the AdGuard plugin needs `httpx>=0.25` and the Wyze plugin needs `httpx<0.20`, one will lose. For the realistic plugin set this rarely matters — most plugins use common HTTP libraries with overlapping needs — but it's a constraint to be aware of when picking deps. If a conflict shows up, the fixes are: pick a wider compatible range, vendor a copy inside your plugin, or talk to the conflicting plugin's author.
+
 ## What curfew-core does at startup
 
-1. Reads `CURFEW_PLUGINS_DIR` (default `/etc/curfew/plugins/`).
+1. Reads `CURFEW_PLUGINS_DIRS` (default: the bundled `plugins/` dir in the image; operators extend with extra colon-separated paths).
 2. For each subdirectory: opens `manifest.toml`, validates required fields, optionally `pip install -r requirements.txt`, imports `plugin.py`, finds the class subclassing `Plugin`, registers it under its `type` name.
 3. Now there's a registry: `{"adguard": AdGuardPlugin, "smart_plug": SmartPlugPlugin, "wyze": WyzePlugin, ...}`.
 4. For each row in the `plugins` table (the operator's assignments): instantiate the plugin with the row's config, hold the instance in memory.
@@ -193,7 +195,7 @@ Curfew calls `reconcile()` with a timeout (configurable via settings). If the ca
 
 ### A plugin's dependencies clash with curfew's
 
-Curfew installs each plugin's `requirements.txt` into a per-plugin sub-environment at startup. Conflicting versions are isolated.
+Curfew installs each plugin's `requirements.txt` into curfew-core's shared Python environment at startup. There is no per-plugin isolation (see "shared environment" note above) — conflicting versions across plugins are the operator's problem to resolve.
 
 ### A plugin file is malformed
 

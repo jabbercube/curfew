@@ -77,12 +77,12 @@ A device-level agent authenticates with a per-device bearer (ADR-006), heartbeat
 
 ### Plugin contract (in-core, event-driven)
 
-A plugin is a Python class subclassing `Plugin` from the plugin SDK. Curfew-core discovers it from `plugins_dir` at startup (ADR-013), instantiates it with operator-supplied config, and calls its `reconcile(scope)` method directly when state changes for a user the plugin governs. No polling, no heartbeat, no auth. A slow safety-net resync re-calls reconcile periodically to catch missed events.
+A plugin is a Python class subclassing `Plugin` from the plugin SDK. Curfew-core discovers it from any directory in `CURFEW_PLUGINS_DIRS` at startup (ADR-013), instantiates it with operator-supplied config, and calls its `reconcile(scope)` method directly when state changes for a user the plugin governs. No polling, no heartbeat, no auth. A slow safety-net resync re-calls reconcile periodically to catch missed events.
 
 **Why two contracts:**
 
 - The core can call plugins directly but can't call agents (NAT, sleep, no inbound). Forcing one contract on both means polluting one with concerns from the other.
-- New agents = new SDK consumer + bootstrap. New plugins = new folder in `plugins_dir`. Different distribution stories naturally; trying to unify them adds friction without value.
+- New agents = new SDK consumer + bootstrap (first-party — no third-party agent extension model). New plugins = new folder in any `CURFEW_PLUGINS_DIRS` entry. Different distribution stories naturally; trying to unify them adds friction without value.
 - Schedule and budget evaluation live in the *core* as rules (ADR-008), not in agents or plugins. Both stay dumb — they see only `{locked, reasons}` for the relevant scope and don't need to understand why.
 
 ## ADR-006: Per-device bearer tokens for agents
@@ -226,9 +226,15 @@ Any operator action that affects the device — lock toggle, settings change, co
 
 **What this also solves:** settings propagation. Changing a setting changes the hash; the next heartbeat surfaces the diff. The agent picks up new tick rates and behaviour without a restart.
 
-## ADR-013: Plugins are drop-in Python modules in `plugins_dir`
+## ADR-013: Plugins are drop-in Python modules in `CURFEW_PLUGINS_DIRS`
 
-**Decided:** in-core plugins are Python packages dropped into a directory mounted into the curfew-core container (default `/etc/curfew/plugins/`, configured via `CURFEW_PLUGINS_DIR`). Curfew-core scans this directory at startup, reads each subdirectory's `manifest.toml`, optionally installs `requirements.txt`, imports `plugin.py`, finds the class subclassing `Plugin`, and registers it.
+**Decided:** in-core plugins are Python packages dropped into any directory listed in `CURFEW_PLUGINS_DIRS` — a colon-separated list (PATH-style). Curfew-core scans each directory in order at startup, reads each subdirectory's `manifest.toml`, optionally installs `requirements.txt` into the shared Python environment, imports `plugin.py`, finds the class subclassing `Plugin`, and registers it under its `type` name. If the same `type` is declared in multiple dirs, later entries win (operator-mounted dirs can override shipped plugins).
+
+The default value of `CURFEW_PLUGINS_DIRS` is the bundled `plugins/` directory inside the curfew-core image — so curfew ships with `adguard`, `smart-plug`, etc. discoverable out of the box. Operators install third-party plugins by mounting another directory into the container and appending its path:
+
+```
+CURFEW_PLUGINS_DIRS=/usr/lib/curfew/plugins:/etc/curfew/plugins
+```
 
 This follows the pattern used by Home Assistant `custom_components`, MkDocs entry points, Django apps, pytest plugins via pluggy, and similar Python-extensible frameworks.
 
@@ -238,7 +244,7 @@ plugins/
 │   ├── manifest.toml      # type, name, version, config_schema, description
 │   ├── plugin.py          # class AdGuardPlugin(Plugin): async def reconcile(...)
 │   └── requirements.txt   # optional pip deps
-└── wyze/                  # operator-authored
+└── wyze/                  # operator-authored, in a separate dir
     ├── manifest.toml
     ├── plugin.py
     └── requirements.txt
@@ -249,10 +255,12 @@ plugins/
 - **Sidecar containers (one docker container per plugin, HTTP between core and plugin).** Higher friction for plugin authors (write a docker image + an HTTP server) without a corresponding benefit at homelab scale. The "language flexibility" argument doesn't apply for the audience curfew serves.
 - **Pip-installed plugins via setuptools entry points.** Standard but requires rebuilding the curfew-core image to add a plugin. Defeats the "drop a folder, restart" UX that the operator should expect.
 - **Hot-reload on file change.** Adds significant complexity (module unloading is tricky in Python) without enough payoff. Restarting curfew-core to pick up new plugin code is a few seconds; toggling existing plugins (pause / unpause) doesn't need a restart.
+- **Per-plugin Python sub-environments.** Python doesn't actually support per-module dependency isolation in one process — `sys.modules` is global, and pip-install with `--target` plus `sys.path` munging is fragile (transitive deps clobber each other). The honest model is one shared environment.
 
 **Trade-offs accepted:**
 
-- **No crash isolation.** A plugin bug can crash curfew-core. Mitigated by catching exceptions at the `reconcile()` boundary and converting them to logged errors. Plugins doing genuinely unsafe things (importing bad C, hanging the event loop) can still cause problems — but for the audience (operator-vetted Python), the realistic failure surface is "the HTTP call to AdGuard returned 500."
-- **Python only.** Plugin authors who want a different language are out. For homelab plugins, Python is fine; if a use case for non-Python plugins ever shows up, the sidecar/HTTP shape can be added back as an alternative without removing the drop-in shape.
+- **Shared Python environment.** All plugins share curfew-core's process and its installed packages. Conflicting `requirements.txt` versions are the operator's problem to resolve (pick a compatible version range, or vendor inside the plugin). For curfew's intended plugin set this is fine; the realistic plugins target common HTTP libraries with overlapping needs.
+- **No crash isolation.** A plugin bug can crash curfew-core. Mitigated by catching exceptions at the `reconcile()` boundary and converting them to logged errors. Plugins doing genuinely unsafe things (importing bad C, hanging the event loop, unbounded memory use) can still cause problems — but for the audience (operator-vetted Python), the realistic failure surface is "the HTTP call to AdGuard returned 500."
+- **Python only.** Plugin authors who want a different language are out. For homelab plugins, Python is fine; if a use case for non-Python plugins ever shows up, the sidecar/HTTP shape can be added as an alternative without removing the drop-in shape.
 
-**Why this is a kernel commitment:** the plugin discovery model is part of the plugin contract. Operators install plugins by dropping folders in; plugin authors structure their code around `manifest.toml` + `plugin.py`. Changing this later means rewriting every plugin.
+**Why this is a kernel commitment:** the plugin discovery model is part of the plugin contract. Operators install plugins by dropping folders into a `CURFEW_PLUGINS_DIRS` entry; plugin authors structure their code around `manifest.toml` + `plugin.py`. Changing this later means rewriting every plugin.

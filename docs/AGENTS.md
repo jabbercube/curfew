@@ -20,6 +20,17 @@ Each managed device has at most one agent installed. The agent's *type* identifi
 - Tokens are per-device — revocation is "this PC is compromised, cut it off." That's the actual revocation case anyone has.
 - Multiple things to enforce on the same device (block exes + apply registry policy + kill processes) live inside the one agent's reconcile logic.
 
+## Agent code is first-party only
+
+Unlike plugins, agents don't have a drop-in third-party extension model. Adding new behaviour to an agent means extending the agent's source — either contributing upstream or maintaining a fork. There is no `agent_plugins/` directory or equivalent.
+
+If you want to add new on-device enforcement (e.g. a screen-time recorder for Windows alongside the existing app blocking), the realistic path is:
+
+1. Open a PR against the windows-pc agent to add the capability natively, or
+2. Maintain a fork of the agent with your additions.
+
+This is a deliberate trade-off. Per-device extension would mean either multiple agents per device (which we explicitly rejected — different failure-mode signals for the same underlying "is this device reachable" question) or a sub-plugin system inside the agent (real complexity for a use case that doesn't yet exist). The bring-your-own story for curfew lives on the plugin side, where it's a good fit.
+
 ## Lifecycle: what installation actually looks like
 
 Concrete walkthrough for `windows-pc` on a PC named `gamingrig`, owned by user `kid1`:
@@ -107,7 +118,13 @@ The exact API surface is implementation detail — what matters is that the agen
 
 ### Drift
 
-If an agent stops heartbeating (PC off, agent crashed, network down), `GET /v1/agents` shows it as drifted after `drift_threshold_seconds` (default 180s = 3 missed ticks). The lock state in curfew-core is *unchanged* — the database still says kid1 is locked, but the device isn't enforcing because nothing's running there. **Drift = unenforced.**
+`GET /v1/agents` reports each agent in one of three states:
+
+- **`pending`** — assigned but `last_heartbeat IS NULL`. The operator ran `curfew agent install` but hasn't run the bootstrap on the device yet. Not an alert.
+- **`healthy`** — heartbeating within `drift_threshold_seconds`.
+- **`drifted`** — heartbeated at least once but not within the threshold. **This is the alert state.**
+
+If an agent transitions to drifted (PC off, agent crashed, network down), the lock state in curfew-core is *unchanged* — the database still says kid1 is locked, but the device isn't enforcing because nothing's running there. **Drift = unenforced.**
 
 Two mitigations exist as features (see PLAN.md):
 
