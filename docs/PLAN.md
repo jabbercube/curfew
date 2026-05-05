@@ -60,7 +60,7 @@ The schema is created in the initial migration with all fields the system will e
 
 | Table | Purpose |
 |-------|---------|
-| `users` | name (PK), role, target_apps (JSON list), schedule (JSON expr, nullable), budget_minutes (int, nullable) |
+| `users` | name (PK), role, managed (bool), target_apps (JSON list), schedule (JSON expr, nullable), budget_minutes (int, nullable) |
 | `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
 | `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
 | `device_plugins` | (device, type, config JSON) — plugin types expected to govern this device, with per-instance config (e.g. the Windows local user account `windows-pc` should ACL) |
@@ -73,12 +73,13 @@ The schema is created in the initial migration with all fields the system will e
 
 ### Inventory data model — concepts
 
-**Users** are anyone whose screentime curfew might govern (kids) or who manages it (parents). Schedules and budgets attach to people, not devices — a kid with one PC and one tablet shares one daily budget across both.
+**Users** are anyone in the household curfew touches. Two independent axes: `role` (`member` / `manager` / `admin`) determines what a user can do; `managed` (bool) determines whether lock rules apply to them. Schedules and budgets attach to managed users — one user with one PC and one tablet shares one daily budget across both.
 
 | Field | Why it matters |
 |-------|----------------|
 | `name` | Stable identifier used in CLI/API/UI. Short string (`kid1`), not a real name. |
-| `role` | `parent` or `child`. Distinguishes who governs from who is governed; future auth/RBAC keys off this. |
+| `role` | `member`, `manager`, or `admin`. Capabilities are cumulative: `member` has no operator powers; `manager` can lock/unlock managed users; `admin` is everything `manager` is plus can edit users, devices, apps, plugin assignments, and agent manifests. Future auth/RBAC keys off this. |
+| `managed` | Bool. Whether lock rules apply to this user. Independent of `role` — a teen `manager` could be `managed: true` (has lock control over siblings *and* their own rules apply); a houseguest could be `member, managed: false` (no powers, not subject to rules). When `false`, `GET /v1/users/{user}/status` always returns `{locked: false, reasons: []}` and the rule pipeline is skipped. |
 | `target_apps` | Apps that get blocked when this user is in a locked state (manual lock today; out-of-schedule and budget-exhausted in later phases). References keys in `apps`. |
 | `schedule` | Optional schedule expression (e.g. `"weekday 16:00-20:00"`). Read by the schedule-lock feature when registered. |
 | `budget_minutes` | Optional daily/weekly budget. Read by the budget-lock feature when registered. |
@@ -306,7 +307,7 @@ Pre-commit hooks for lint/format. Type hints required (`mypy --strict` for the c
 
 The kernel is "done" when this end-to-end walkthrough passes against the **reference test plugin** (a no-op SDK consumer in the test suite that heartbeats, observes lock-status changes, and writes a sentinel file when locked). The reference plugin exercises the kernel end-to-end without depending on any feature-level plugin.
 
-1. CLI creates a user (`curfew user add kid1 --role child`), a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`), and an app (`curfew app add steam --exe-path ...`).
+1. CLI creates a user (`curfew user add kid1 --role member --managed true`), a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`), and an app (`curfew app add steam --exe-path ...`).
 2. CLI publishes the reference plugin's first version (`curfew agent publish reftest 1.0.0 ./reftest.py`).
 3. CLI assigns the reference plugin to the device (`curfew plugin assign reftest gamingrig`); verify the `plugin_instances` row was created in the same transaction.
 4. CLI mints a token (`curfew plugin token mint reftest:gamingrig`); CLI prints the secret once and the bootstrap one-liner.
