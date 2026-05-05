@@ -1,13 +1,13 @@
 # curfew — Plan
 
-CLI- and (later) web-driven tool to manage screentime across the household. Built around an **API-first, plugin-based** architecture: a small dockerized core service holds state and exposes an HTTP API; *plugins* implement specific enforcement methods (Windows PC lockout, DNS sinkhole, smart plugs, router ACLs, etc.). New methods are added by writing new plugins. The CLI and a future GUI are both thin clients of the same API.
+CLI- and (later) web-driven tool to manage screentime across the household. Built around an **API-first** architecture: a small dockerized core service holds state and exposes an HTTP API. Two extension surfaces implement enforcement — **agents** on managed devices (Windows PC lockout, future Mac/Linux) and **plugins** in-core (DNS sinkhole, smart plugs, router ACLs, etc.). New enforcement methods are added by writing new agents or plugins. The CLI and a future GUI are both thin clients of the same API.
 
 ## Goals
 
-1. **Modular** — each enforcement method is an independent plugin.
-2. **API-first** — the core HTTP API is the contract. CLI, GUI, plugins, and any future surface are all clients.
+1. **Modular** — each enforcement method is an independent agent or plugin.
+2. **API-first** — the core HTTP API is the contract. CLI, GUI, agents, and any future surface are all clients.
 3. **Docker-hosted core** — the user runs the core as a docker compose stack alongside other homelab services.
-4. **Pull-based enforcement** — plugins reconcile against state on a timer. Self-heals through reboots, sleep, and network changes.
+4. **Pull-based agents, event-driven plugins** — agents (on-device) poll and reconcile on a timer; plugins (in-core) are called directly when state changes. Both self-heal through reboots, sleep, and network changes (see ADR-003).
 5. **Well-tested** — core, CLI, plugin SDK, and individual plugins all have automated tests in CI.
 6. **Kernel-then-features progression** — build a complete kernel up front; layer features on top in any order.
 
@@ -150,7 +150,7 @@ One agent per device. The agent code is `windows-pc-agent`, `macos-pc-agent`, et
 4. Core records `last_heartbeat` on each tick. `GET /v1/agents` returns `last_heartbeat` (and `last_heartbeat IS NULL` if the agent has never reported in yet — assigned but not bootstrapped). The kernel doesn't interpret this as an alert: a powered-off device looks the same as a broken agent without an independent presence signal. Real "device is on but agent isn't checking in" alerting is the Reachability monitoring feature.
 5. Removal: `curfew agent uninstall gamingrig` → deletes the `device_agents` row → `agent_instances` cascade-deletes → outstanding tokens revoked → next agent tick gets 401 → operator removes the local install.
 
-**Drift = unenforced.** An agent that isn't heartbeating isn't enforcing. The database knows the user is locked; the device doesn't. Drift surfaces on `GET /v1/agents` for the operator to investigate. Optional fail-closed agent behaviour (auto-lock on disconnect) is a feature on top — see "Auto-lock on disconnect."
+**A non-heartbeating agent isn't enforcing.** The database knows the user is locked; if the agent isn't running, the device doesn't. The kernel records `last_heartbeat` but doesn't interpret stale values as an alert — a powered-off device looks the same as a broken one. Two features close this gap: **auto-lock on disconnect** (agent-side fail-closed; the agent locks itself when it can't reach the core) is the primary mitigation, and **reachability monitoring** (operator-side detection of "device on but agent silent") is the alert signal. Both are described under Features.
 
 ## Plugin lifecycle
 
@@ -171,9 +171,9 @@ plugins/
     └── requirements.txt
 ```
 
-1. **Discovery** (at curfew-core startup): scan each directory in `CURFEW_PLUGINS_DIRS` in order. For each subdirectory: read `manifest.toml`, optionally `pip install -r requirements.txt` into curfew-core's shared Python environment, import `plugin.py`, find the class subclassing `Plugin`, register it under its `type` name.
+1. **Discovery** (at curfew-core startup): scan each directory in `CURFEW_PLUGINS_DIRS` in order. For each subdirectory: read `manifest.toml`, optionally `pip install -r requirements.txt` into curfew-core's shared Python environment, import `plugin.py`, find the class subclassing `Plugin`, register it under its `type` name. Each `plugin.py` must declare **exactly one** `Plugin` subclass — zero or multiple is a discovery error, the plugin is skipped, the error is logged and surfaced on `GET /v1/plugins/types`.
 2. **Assignment** (operator): `curfew plugin assign adguard --config '{"url": "..."}' --governs '["*"]'`. Validates config against the plugin's Pydantic schema, inserts a row in `plugins`, instantiates the plugin in memory.
-3. **Reconciliation** (event-driven): when state changes for a user the plugin governs (lock toggled, schedule fired, etc.), curfew-core calls the plugin's `reconcile()` method directly. In-process function call; latency is microseconds.
+3. **Reconciliation** (event-driven, async to the originating request): when state changes for a user the plugin governs (lock toggled, schedule fired, etc.), curfew-core schedules `reconcile()` calls on every governing plugin as background tasks. The originating API request returns immediately after the database write; the reconciles fire in the background. A reconcile failure is logged and recorded in the audit log but doesn't fail the originating request — slow plugins don't delay the operator. Operators check the audit log if they need to confirm reconcile succeeded.
 4. **Safety-net resync** (slow tick, default every 5 minutes): curfew-core walks all governed users and calls `reconcile()` on each registered plugin instance for each governed user. Catches missed events from restarts.
 5. **Pause / unpause**: `curfew plugin pause adguard` flips a `paused` flag. The core stops calling reconcile until unpaused; the instance stays loaded and config is preserved.
 6. **Removal**: `curfew plugin unassign adguard` deletes the row, drops the in-memory instance.
@@ -277,7 +277,7 @@ The curfew-core API service has two surfaces for tunable values:
 - **Config** is boot-time and immutable for the life of the process. Comes from env vars, an optional `.env`, and `config.json`. Used for values needed before the database is open (db path, listen address, root token).
 - **Settings** are runtime-mutable, stored in the database, edited via the API/CLI. No restart required. Used for operational knobs (tick rates, retention windows, thresholds).
 
-Plugin agents have their own bootstrap config (`agent.config` per instance — see "Plugin instance lifecycle"). This section is about the curfew-core API service.
+Agents have their own bootstrap config (`agent.config` per device — see "Agent lifecycle"). This section is about the curfew-core API service.
 
 ### Config sources (boot-time)
 
@@ -317,7 +317,8 @@ API: `GET /v1/settings` (read all), `PATCH /v1/settings` (update one or more). C
 
 ## Authentication
 
-- **Plugin auth**: per-instance bearer tokens (ADR-006). Hashed at rest. Read scope is full state in the kernel; future tightening to scoped reads is a feature on top.
+- **Agent auth**: per-device bearer tokens (ADR-006). Hashed at rest in `agent_tokens`. Read scope is full state in the kernel; future tightening (a `gamingrig` token can only read kid1's slice) is a feature on top.
+- **Plugin auth**: none. Plugins are in-process Python modules; the core calls their `reconcile()` directly. There's no network boundary to authenticate.
 - **Operator auth**: V1 uses a single **root bearer token** (`CURFEW_ROOT_TOKEN` env var; see "Configuration and settings"), distinct from the `admin` user role (which is data-only in V1 — no way for a user with `role: admin` to authenticate yet). Per-user role-based auth (sessions tied to user records) is a feature on top of the kernel; the API surface is shaped to accept it without renames.
 
 ## Audit log
@@ -354,7 +355,7 @@ Agents (per-device extension surface)
   GET    /v1/agents                             list installed agents with last_heartbeat (consumer interprets staleness)
   POST   /v1/devices/{device}/agent             body { type, config }; installs an agent on this device, mints a bearer, returns { token: { id, secret }, bootstrap }
   DELETE /v1/devices/{device}/agent             uninstall the agent (deletes device_agents + agent_instances rows, revokes tokens)
-  POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version }; returns { state_hash, agent_tick_seconds, ... }
+  POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version, errors?: [...] }; returns { state_hash, agent_tick_seconds, ... }
   GET    /v1/devices/{device}/state             full state for this device's agent: scoped lock status, agent config, target apps, relevant app catalog entries
   POST   /v1/devices/{device}/activity          body { user, occurred_at, ... }; no-op until budget rule registered
   POST   /v1/devices/{device}/tokens            mint an additional bearer for this device; returns { id, secret }
@@ -372,7 +373,7 @@ Locks
   POST   /v1/users/{user}/lock                  manual lock
   POST   /v1/users/{user}/unlock                manual unlock
 
-Lock status
+Lock status (operator/admin reads; agents go through /v1/devices/{device}/state instead, plugins receive scope as a function-call argument)
   GET    /v1/users/{user}/status                { locked: bool, reasons: [{kind, ...}] }
   GET    /v1/devices/{device}/status            { locked: bool, reasons: [{kind, ...}] } — empty pipeline in kernel
 
@@ -496,7 +497,7 @@ The kernel is "done" when both extension surfaces work end-to-end. Two reference
 2. CLI publishes the reference agent's first version (`curfew agent publish reftest 1.0.0 ./reftest_agent.tar`).
 3. CLI installs the reference agent (`curfew agent install reftest gamingrig --config '{}'`); verify the `device_agents` and `agent_instances` rows are created in the same transaction; CLI prints the secret once and the bootstrap one-liner.
 4. The reference agent runs the bootstrap. It fetches the manifest, verifies SHA-256, installs.
-5. Agent heartbeats; `GET /v1/agents` shows it healthy.
+5. Agent heartbeats; `GET /v1/agents` shows `last_heartbeat` advancing on each tick.
 6. Stop the agent; `GET /v1/agents` shows the agent's `last_heartbeat` no longer advancing (interpretation is the consumer's job — the kernel just records).
 7. CLI locks the user (`curfew lock kid1`); the manual_lock rule fires; `GET /v1/users/kid1/status` returns `{locked: true, reasons: [{kind: "manual_lock"}]}`.
 8. State-hash mismatch on next heartbeat → agent pulls `/state` → reads lock status → writes its sentinel file.
