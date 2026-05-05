@@ -8,7 +8,7 @@ CLI- and (later) web-driven tool to manage screentime across the household. Buil
 2. **API-first** — the core HTTP API is the contract. CLI, GUI, agents, and any future surface are all clients.
 3. **Docker-hosted core** — the user runs the core as a docker compose stack alongside other homelab services.
 4. **Pull-based agents, event-driven plugins** — agents (on-device) poll and reconcile on a timer; plugins (in-core) are called directly when state changes. Both self-heal through reboots, sleep, and network changes (see ADR-003).
-5. **Well-tested** — core, CLI, plugin SDK, and individual plugins all have automated tests in CI.
+5. **Well-tested** — core, CLI, both SDKs (agent and plugin), and individual agents and plugins all have automated tests in CI.
 6. **Kernel-then-features progression** — build a complete kernel up front; layer features on top in any order.
 
 ## Architecture & topology
@@ -42,7 +42,7 @@ Three places code physically lives:
 The plan is *not* a feature timeline (V1 → V5+). It's two sections:
 
 - **The kernel** is the set of architectural primitives every feature depends on. It is built once, complete and tested. Features stack on top without reshaping the kernel.
-- **Features** are unordered. Implement whatever's most needed when. Manual lock can come before schedule lock; adguard can come before windows-pc; the GUI can come before budgets. The kernel doesn't notice.
+- **Features** are unordered. Implement whatever's most needed when. Manual lock can come before schedule lock; adguard can come before windows-agent; the GUI can come before budgets. The kernel doesn't notice.
 
 This shape exists because the alternative — feature-phased V1 → V5+ — keeps creating "we'll add it in V2" commitments that turn into refactors. The kernel is bigger up front; everything after it is genuinely additive.
 
@@ -95,11 +95,11 @@ The kernel commits to none of the above; pick when the first non-kernel rule (li
 
 | Field | Why it matters |
 |-------|----------------|
-| `name` | Used in CLI/UI and as part of plugin instance names (`windows-pc:gamingrig`). |
+| `name` | Used in CLI/UI and in API paths (`/v1/devices/gamingrig/...`). The agent installed on a device is identified by the device name; there's no compound `<type>:<device>` identifier. |
 | `owner` | The user this device belongs to. For managed devices, also the user whose schedule/budget activity here debits. Null = shared device (governed as a group via the shared-device-lock feature when registered). |
 | `type` | `pc | laptop | phone | tablet | console | tv`. Constrains which plugin types apply. |
 | `os` | `windows | macos | linux | ios | android`. Selects per-device plugin variants. |
-| `mac` | Network-layer identity, stable across IP changes. List, since a device commonly has multiple MACs (Wi-Fi + ethernet; randomized per network). Read by network-side plugins. |
+| `mac` | Network-layer identity, stable across IP changes. List, since a device commonly has multiple MACs (Wi-Fi + ethernet; randomized per network). Read by network-side plugins (e.g. `router-acl`) and by the Reachability monitoring feature for ARP probes. |
 | `managed` | Whether curfew governs this device at all. Lets devices be tracked for completeness without being put under policy (e.g. a manager's laptop tracked but not enforced). |
 
 **Why people *and* devices, not just users-with-a-list-of-devices:**
@@ -138,9 +138,9 @@ Same goal — *given a user's lock state, make my surface reflect it* — but th
 
 ## Agent lifecycle
 
-One agent per device. The agent code is `windows-pc-agent`, `macos-pc-agent`, etc. — an installable program that runs on the device and polls curfew-core.
+One agent per device. The agent code is `windows-agent`, `macos-agent`, etc. — an installable program that runs on the device and polls curfew-core.
 
-1. Operator installs the agent on a device (`curfew agent install windows-pc gamingrig --config '{"windows_user": "Kid1Local"}'`). This:
+1. Operator installs the agent on a device (`curfew agent install windows-agent gamingrig --config '{"windows_user": "Kid1Local"}'`). This:
    - Inserts a row in `device_agents`.
    - Creates the matching `agent_instances` row in the same transaction.
    - Mints a device-scoped bearer token (one row in `agent_tokens`); returns the secret once.
@@ -157,22 +157,26 @@ One agent per device. The agent code is `windows-pc-agent`, `macos-pc-agent`, et
 Plugins are Python modules dropped into any directory listed in `CURFEW_PLUGINS_DIRS` — a colon-separated list of paths (PATH-style). The default is the bundled `plugins/` directory inside the curfew-core image; operators add more entries to install third-party plugins (e.g. `CURFEW_PLUGINS_DIRS=/usr/lib/curfew/plugins:/etc/curfew/plugins`). Directories are scanned in order; if the same `type` is declared in two of them, the later entry wins (so operator-mounted dirs can override shipped plugins). Each subdirectory is one plugin type.
 
 ```
-plugins/
+# Bundled (read-only, baked into the curfew-core image)
+/usr/lib/curfew/plugins/
 ├── adguard/
 │   ├── manifest.toml      # type, name, version, config_schema, description
 │   ├── plugin.py          # subclasses Plugin, implements reconcile()
 │   └── requirements.txt   # optional pip deps
-├── smart_plug/
-│   ├── manifest.toml
-│   └── plugin.py
-└── wyze/                  # operator-authored
+└── smart_plug/
+    ├── manifest.toml
+    └── plugin.py
+
+# Operator-mounted (writable; mounted from a docker volume)
+/etc/curfew/plugins/
+└── wyze/                  # operator-authored, third-party
     ├── manifest.toml
     ├── plugin.py
     └── requirements.txt
 ```
 
 1. **Discovery** (at curfew-core startup): scan each directory in `CURFEW_PLUGINS_DIRS` in order. For each subdirectory: read `manifest.toml`, optionally `pip install -r requirements.txt` into curfew-core's shared Python environment, import `plugin.py`, find the class subclassing `Plugin`, register it under its `type` name. Each `plugin.py` must declare **exactly one** `Plugin` subclass — zero or multiple is a discovery error, the plugin is skipped, the error is logged and surfaced on `GET /v1/plugins/types`.
-2. **Assignment** (operator): `curfew plugin assign adguard --config '{"url": "..."}' --governs '["*"]'`. Validates config against the plugin's Pydantic schema, inserts a row in `plugins`, instantiates the plugin in memory.
+2. **Assignment** (operator): `curfew plugin assign adguard --config '{"url": "..."}' --governs '["*"]'`. Validates config against the plugin's Pydantic schema, inserts a row in `plugins`, instantiates the plugin in memory. **Convention: secrets stay in env, not in config.** A plugin needing a secret declares an `*_env` field (e.g. `api_token_env: "ADGUARD_TOKEN"`) and reads `os.environ[name]` at runtime; the config row holds only the env-var name. This keeps `state.sqlite` and `GET /v1/plugins` free of plaintext secrets.
 3. **Reconciliation** (event-driven, async to the originating request): when state changes for a user the plugin governs (lock toggled, schedule fired, etc.), curfew-core schedules `reconcile()` calls on every governing plugin as background tasks. The originating API request returns immediately after the database write; the reconciles fire in the background. A reconcile failure is logged and recorded in the audit log but doesn't fail the originating request — slow plugins don't delay the operator. Operators check the audit log if they need to confirm reconcile succeeded.
 4. **Safety-net resync** (slow tick, default every 5 minutes): curfew-core walks all governed users and calls `reconcile()` on each registered plugin instance for each governed user. Catches missed events from restarts.
 5. **Pause / unpause**: `curfew plugin pause adguard` flips a `paused` flag. The core stops calling reconcile until unpaused; the instance stays loaded and config is preserved.
@@ -186,7 +190,7 @@ See [PLUGINS.md](PLUGINS.md) for the plugin author's guide and [AGENTS.md](AGENT
 
 ## Agent update integrity
 
-Plugins running on devices fetch their agent code from the core. Updates are versioned and hash-verified:
+Agents on devices fetch their code from the core. Updates are versioned and hash-verified:
 
 - `GET /v1/agents/{type}/manifest` → `{ version, sha256, url }`.
 - Agent compares the manifest's version to its installed version. If different: fetch `url`, verify SHA-256 matches the manifest, swap atomically.
@@ -203,8 +207,8 @@ Two distinct SDKs because agents and plugins are different shapes:
 
 Polling-loop SDK with two flavors. An agent author writes a reconciler; the SDK runs the loop, the heartbeat, the manifest fetch, the hash verification, and the error reporting.
 
-- **`curfew_agent_sdk_python`** — for `macos-pc` and any future Linux/macOS agent.
-- **`curfew-agent-sdk-powershell`** — for `windows-pc` and any future Windows agent.
+- **`curfew_agent_sdk_python`** — for `macos-agent` and any future Linux/macOS agent.
+- **`curfew-agent-sdk-powershell`** — for `windows-agent` and any future Windows agent.
 
 Both expose:
 
@@ -252,8 +256,8 @@ The plugin SDK is much smaller than the agent SDK because most of the agent SDK'
 
 The kernel ships two no-op test consumers:
 
-- **`reftest-agent`** — exercises the agent SDK end-to-end (bootstrap, manifest fetch, heartbeat, state pull, reconcile).
-- **`reftest-plugin`** — exercises the plugin SDK end-to-end (discovery, instantiation, reconcile call).
+- **`reftest_agent`** — exercises the agent SDK end-to-end (bootstrap, manifest fetch, heartbeat, state pull, reconcile).
+- **`reftest_plugin`** — exercises the plugin SDK end-to-end (discovery, instantiation, reconcile call).
 
 Both live in the test suite; they're what the kernel acceptance test runs against, so the kernel can be tested without depending on any feature-level agent or plugin.
 
@@ -261,14 +265,14 @@ Both live in the test suite; they're what the kernel acceptance test runs agains
 
 | Consumer | Kind | Where it runs | SDK |
 |---|---|---|---|
-| `windows-pc` | agent | Windows PC | `curfew-agent-sdk-powershell` |
-| `macos-pc` | agent | macOS device | `curfew_agent_sdk_python` |
+| `windows-agent` | agent | Windows PC | `curfew-agent-sdk-powershell` |
+| `macos-agent` | agent | macOS device | `curfew_agent_sdk_python` |
 | `adguard` | plugin | in-core (curfew-core process) | plugin SDK |
 | `smart-plug` | plugin | in-core | plugin SDK |
 | `router-acl` | plugin | in-core | plugin SDK |
 | `tailscale-acl` | plugin | in-core | plugin SDK |
-| `reftest-agent` | agent (test) | test harness | `curfew_agent_sdk_python` |
-| `reftest-plugin` | plugin (test) | in-core | plugin SDK |
+| `reftest_agent` | agent (test) | test harness | `curfew_agent_sdk_python` |
+| `reftest_plugin` | plugin (test) | in-core | plugin SDK |
 
 ## Configuration and settings
 
@@ -353,6 +357,7 @@ User / device / app CRUD
 
 Agents (per-device extension surface)
   GET    /v1/agents                             list installed agents with last_heartbeat (consumer interprets staleness)
+  GET    /v1/devices/{device}/agent             fetch the agent installed on this device (type, config, last_heartbeat, last_seen_version)
   POST   /v1/devices/{device}/agent             body { type, config }; installs an agent on this device, mints a bearer, returns { token: { id, secret }, bootstrap }
   DELETE /v1/devices/{device}/agent             uninstall the agent (deletes device_agents + agent_instances rows, revokes tokens)
   POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version, errors?: [...] }; returns { state_hash, agent_tick_seconds, ... }
@@ -424,11 +429,11 @@ curfew/
 │   ├── curfew_agent_sdk_python/       # Python agent SDK (polling, heartbeat, self-update)
 │   └── curfew-agent-sdk-powershell/   # PowerShell agent SDK module (parallel, for Windows)
 ├── agents/
-│   ├── windows-pc/
+│   ├── windows-agent/
 │   │   ├── agent.ps1                  # uses the PowerShell agent SDK
 │   │   ├── install-agent.ps1          # bootstrap installer
 │   │   └── tests/                     # Pester tests
-│   └── macos-pc/
+│   └── macos-agent/
 │       ├── agent.py                   # uses the Python agent SDK
 │       ├── install-agent.sh           # bootstrap installer
 │       └── tests/
@@ -483,7 +488,7 @@ curfew/
 
 CI runs on every push:
 - **Linux runner**: ruff + mypy + pytest (unit, API, CLI, e2e with docker compose).
-- **Windows runner**: Pester for the PowerShell agent SDK + windows-pc agent + installer smoke test.
+- **Windows runner**: Pester for the PowerShell agent SDK + windows-agent agent + installer smoke test.
 
 Pre-commit hooks for lint/format. Type hints required (`mypy --strict` for the core).
 
@@ -517,7 +522,7 @@ The kernel is "done" when both extension surfaces work end-to-end. Two reference
 
 17. `audit_log` contains a structured row for every API write in the entire sequence.
 
-windows-pc and adguard land as the first real feature implementations of each surface, immediately after the kernel passes.
+windows-agent and adguard land as the first real feature implementations of each surface, immediately after the kernel passes.
 
 ---
 
@@ -555,8 +560,8 @@ Adds a `device_app_overrides(device, app, exe_paths, process_names, urls)` table
 
 On-device agent implementations. Each is a new agent type — a published agent artifact + a bootstrap installer. The agent SDK handles polling, heartbeating, and self-update; the agent author writes the reconciler.
 
-- **`windows-pc`** (`curfew-agent-sdk-powershell`) — first agent; stress-tests the agent contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
-- **`macos-pc`** (`curfew_agent_sdk_python`) — same primitives translated for macOS.
+- **`windows-agent`** (`curfew-agent-sdk-powershell`) — first agent; stress-tests the agent contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
+- **`macos-agent`** (`curfew_agent_sdk_python`) — same primitives translated for macOS.
 
 Future: `linux-pc`, embedded-device agents, etc.
 
@@ -621,7 +626,7 @@ Almost certainly never needed. Pull-based at 60s tick is fine for screentime for
 
 Implementation-level decisions still pending — none are kernel-architectural:
 
-1. **Agent language for `windows-pc`** — pure PowerShell (zero deps on Windows) or bundled Python (cleaner state logic, requires runtime install)? *Lean: PowerShell for managed PCs to stay dependency-free.*
+1. **Agent language for `windows-agent`** — pure PowerShell (zero deps on Windows) or bundled Python (cleaner state logic, requires runtime install)? *Lean: PowerShell for managed PCs to stay dependency-free.*
 2. **Mid-session lock behaviour** — kill running processes immediately, force logoff, or just block future launches? *Lean: kill matching processes (with a config knob to opt out).*
 3. **Initial app list** — Steam, Minecraft, YouTube definite; decide on Roblox, Discord, Twitch.
 4. **CI runners** — public GitHub Actions (free Windows runner) vs. self-hosted on the homelab? *Lean: GitHub Actions until private code or speed becomes an issue.*

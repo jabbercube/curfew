@@ -14,7 +14,7 @@ Agents exist because the alternative — curfew-core reaching out to the device 
 
 ## One agent per device
 
-Each managed device has at most one agent installed. The agent's *type* identifies what it knows how to do (`windows-pc`, `macos-pc`, etc.) — the type is implementation, not configuration. A device runs one agent because:
+Each managed device has at most one agent installed. The agent's *type* identifies what it knows how to do (`windows-agent`, `macos-agent`, etc.) — the type is implementation, not configuration. A device runs one agent because:
 
 - The realistic failure modes (PC off, network down, agent crashed, OS rebooting) all knock out *every* enforcement on that device simultaneously. Per-thing-it-enforces heartbeats would give you N independent signals for one underlying signal.
 - Tokens are per-device — revocation is "this PC is compromised, cut it off." That's the actual revocation case anyone has.
@@ -26,23 +26,23 @@ Unlike plugins, agents don't have a drop-in third-party extension model. Adding 
 
 If you want to add new on-device enforcement (e.g. a screen-time recorder for Windows alongside the existing app blocking), the realistic path is:
 
-1. Open a PR against the windows-pc agent to add the capability natively, or
+1. Open a PR against the windows-agent agent to add the capability natively, or
 2. Maintain a fork of the agent with your additions.
 
 This is a deliberate trade-off. Per-device extension would mean either multiple agents per device (which we explicitly rejected — different failure-mode signals for the same underlying "is this device reachable" question) or a sub-plugin system inside the agent (real complexity for a use case that doesn't yet exist). The bring-your-own story for curfew lives on the plugin side, where it's a good fit.
 
 ## Lifecycle: what installation actually looks like
 
-Concrete walkthrough for `windows-pc` on a PC named `gamingrig`, owned by user `kid1`:
+Concrete walkthrough for `windows-agent` on a PC named `gamingrig`, owned by user `kid1`:
 
 ### 1. Operator runs `curfew agent install`
 
 ```
-curfew agent install windows-pc gamingrig --config '{"windows_user": "Kid1Local"}'
+curfew agent install windows-agent gamingrig --config '{"windows_user": "Kid1Local"}'
 ```
 
 This:
-- Inserts a row into `device_agents(device=gamingrig, type=windows-pc, config=...)`.
+- Inserts a row into `device_agents(device=gamingrig, type=windows-agent, config=...)`.
 - Creates the matching `agent_instances(device=gamingrig)` runtime row in the same transaction (initially with no heartbeats yet).
 - Mints a device-scoped bearer token, hashes it, inserts into `agent_tokens`.
 - Prints `{token: { id, secret }, bootstrap: "..."}`. The secret is shown once.
@@ -52,11 +52,11 @@ This:
 The CLI printed something like:
 
 ```powershell
-iex (irm https://curfew.homelab.local/bootstrap/windows-pc?token=SECRET)
+iex (irm https://curfew.homelab.local/bootstrap/windows-agent?token=SECRET)
 ```
 
 That command:
-- Fetches `GET /v1/agents/windows-pc/manifest` → `{ version, sha256, url }`.
+- Fetches `GET /v1/agents/windows-agent/manifest` → `{ version, sha256, url }`.
 - Downloads the agent artifact (a PowerShell script + the `curfew-agent-sdk-powershell` module bundled together) from `url`.
 - Verifies the SHA-256 matches what the manifest said.
 - Installs the files locally, drops `agent.config` (API URL, device name, bearer secret).
@@ -74,7 +74,7 @@ Each tick:
 - Reconciler given `{locked: false}`: undo all of the above.
 
 Separately, on a slower tick (default hourly):
-- GET `/v1/agents/windows-pc/manifest`. If `version` differs from installed, fetch `url`, verify hash, swap atomically.
+- GET `/v1/agents/windows-agent/manifest`. If `version` differs from installed, fetch `url`, verify hash, swap atomically.
 
 ### 4. Operator removes the agent
 
@@ -93,7 +93,7 @@ This:
 Most of the loop above is in the SDK (`curfew_agent_sdk_python` for Linux/macOS, `curfew-agent-sdk-powershell` for Windows). The author writes a **reconciler** — given the current lock status and config, do the right thing. Sketch:
 
 ```powershell
-# windows-pc/agent.ps1
+# windows-agent/agent.ps1
 Import-Module curfew-agent-sdk-powershell
 
 Register-Reconciler -ScriptBlock {

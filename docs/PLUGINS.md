@@ -6,7 +6,7 @@ For on-device extensions (programs that run on a kid PC or Mac), see [AGENTS.md]
 
 ## What a plugin is
 
-A plugin is a Python module that extends curfew-core in-process. Drop a folder into any directory listed in `CURFEW_PLUGINS_DIRS`, restart the core, and curfew imports your code at startup. When state changes for a user the plugin governs, the core calls your `reconcile()` method directly.
+A plugin is a Python module that extends curfew-core in-process. Drop a folder into any directory listed in `CURFEW_PLUGINS_DIRS`, restart the core, and curfew imports your code at startup. When state changes for a user the plugin governs, the core schedules your `reconcile()` method as a background task — the originating API request returns immediately; reconcile runs after.
 
 Plugins are how curfew talks to homelab-resident services: AdGuard for DNS sinkhole, Tasmota/Kasa smart plugs for power control, UniFi/OPNsense for router ACLs, Tailscale for tailnet ACLs, plus anything you write yourself (Wyze, IKEA Tradfri, SmartThings, your own tooling).
 
@@ -26,14 +26,18 @@ The split exists because of physics, not preference. A kid PC can't be reached f
 Each entry in `CURFEW_PLUGINS_DIRS` is a directory holding one subdirectory per plugin type. The default value points at the curfew repo's bundled `plugins/` directory inside the docker image — that's where the shipped plugins (`adguard`, `smart_plug`, etc.) live. Operators add more directories (e.g. a mounted `/etc/curfew/plugins/` volume) to install third-party plugins:
 
 ```
-plugins/
+# Bundled (read-only, baked into the curfew-core image)
+/usr/lib/curfew/plugins/
 ├── adguard/                          # ours
 │   ├── manifest.toml
 │   ├── plugin.py
 │   └── requirements.txt              # optional
-├── smart_plug/                       # ours
-│   ├── manifest.toml
-│   └── plugin.py
+└── smart_plug/                       # ours
+    ├── manifest.toml
+    └── plugin.py
+
+# Operator-mounted (writable; mounted from a docker volume)
+/etc/curfew/plugins/
 └── wyze/                             # operator-authored, third-party
     ├── manifest.toml
     ├── plugin.py

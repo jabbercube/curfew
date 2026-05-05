@@ -50,12 +50,12 @@ Library-first remains the right call only if the project ever scopes back to ter
 **Why event-driven for plugins:**
 
 - The core can call them directly. Polling across an in-process function call is silly.
-- Latency is microseconds — operator runs `curfew lock kid1`, plugin's `reconcile()` is called before the HTTP response returns.
+- Reconciliation runs as a background task scheduled by the originating API request — the operator's `curfew lock kid1` returns as soon as the database write commits; plugins reconcile in the background. Slow or failing plugins don't block the operator. Failures are logged and recorded in the audit log.
 - A slow safety-net resync (default every 5 minutes) re-walks all governed users and re-calls each plugin, catching any missed events from restarts.
 
 ## ADR-004: Agents distributed via bootstrap script
 
-**Decided:** agents (`windows-pc`, future `macos-pc`, etc.) install via a one-line shell/PowerShell bootstrap that drops the agent code + registers a scheduled task / launchd / cron job. The agent self-updates from the core via versioned manifests (ADR-009).
+**Decided:** agents (`windows-agent`, future `macos-agent`, etc.) install via a one-line shell/PowerShell bootstrap that drops the agent code + registers a scheduled task / launchd / cron job. The agent self-updates from the core via versioned manifests (ADR-009).
 
 **Rejected:**
 
@@ -77,7 +77,7 @@ A device-level agent authenticates with a per-device bearer (ADR-006), heartbeat
 
 ### Plugin contract (in-core, event-driven)
 
-A plugin is a Python class subclassing `Plugin` from the plugin SDK. Curfew-core discovers it from any directory in `CURFEW_PLUGINS_DIRS` at startup (ADR-013), instantiates it with operator-supplied config, and calls its `reconcile(scope)` method directly when state changes for a user the plugin governs. No polling, no heartbeat, no auth. A slow safety-net resync re-calls reconcile periodically to catch missed events.
+A plugin is a Python class subclassing `Plugin` from the plugin SDK. Curfew-core discovers it from any directory in `CURFEW_PLUGINS_DIRS` at startup (ADR-013), instantiates it with operator-supplied config, and schedules its `reconcile(scope)` method as a background task when state changes for a user the plugin governs. No polling, no heartbeat, no auth. Failures are logged and audited but don't fail the originating API request. A slow safety-net resync re-calls reconcile periodically to catch missed events.
 
 **Why two contracts:**
 
@@ -139,7 +139,7 @@ Rules implement a single interface, declare their scope at registration, and ret
 
 **Decided:** agents fetch their code via a manifest endpoint (`GET /v1/agents/{type}/manifest` → `{version, sha256, url}`). The agent verifies the SHA-256 of the fetched artifact matches the manifest before swapping atomically. Update checks happen on a slow tick (default hourly); state polling on the fast tick (default 60s).
 
-**Rejected:** "fetch latest `agent.ps1` every minute and execute." Trivially exploitable: anyone who controls the core's static-file path (or MITMs HTTPS without certificate pinning) gets remote code execution on every managed PC, with whatever privileges the agent runs at — admin-equivalent for `windows-pc` (it modifies NTFS ACLs and registry).
+**Rejected:** "fetch latest `agent.ps1` every minute and execute." Trivially exploitable: anyone who controls the core's static-file path (or MITMs HTTPS without certificate pinning) gets remote code execution on every managed PC, with whatever privileges the agent runs at — admin-equivalent for `windows-agent` (it modifies NTFS ACLs and registry).
 
 **Why this is a kernel commitment, not a feature:**
 
@@ -157,8 +157,8 @@ Rules implement a single interface, declare their scope at registration, and ret
 
 Two language flavours sharing one contract:
 
-- `curfew_agent_sdk_python` — for `macos-pc` and any future Linux/macOS agent.
-- `curfew-agent-sdk-powershell` — for `windows-pc` and any future Windows agent.
+- `curfew_agent_sdk_python` — for `macos-agent` and any future Linux/macOS agent.
+- `curfew-agent-sdk-powershell` — for `windows-agent` and any future Windows agent.
 
 Both handle: polling loop, heartbeat dispatch with retry/backoff, hash-based change detection (ADR-012), versioned + hash-verified self-update (ADR-009), error reporting back to core, config bootstrap. An agent author writes the reconciler; the SDK handles the rest.
 
