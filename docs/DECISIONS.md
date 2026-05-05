@@ -204,7 +204,7 @@ A plugin author writes a Python class. The plugin SDK provides types and helpers
 
 ## ADR-012: Agent heartbeats carry a state hash for change detection
 
-**Decided:** every agent heartbeat (`POST /v1/devices/{device}/heartbeat`) carries the agent's last-known state hash plus an optional `errors` array (any local failures the agent wants to surface — reconcile exceptions, OS calls that returned errors, etc.); the server returns its current hash plus a small set of immediate-effect settings (`agent_tick_seconds`, etc.). If the hashes match, the agent has nothing new to do. If they differ, the agent fetches full state via `GET /v1/devices/{device}/state` and re-runs the reconciler. Reported errors are recorded in the audit log.
+**Decided:** every agent heartbeat (`POST /v1/devices/{device}/heartbeat`) carries the agent's last-known state hash plus an optional `errors` array of `{kind, message, occurred_at}` objects (any local failures the agent wants to surface — reconcile exceptions, OS calls that returned errors, etc.); the server returns its current hash plus a small set of immediate-effect settings (`agent_tick_seconds`, etc.). If the hashes match, the agent has nothing new to do. If they differ, the agent fetches full state via `GET /v1/devices/{device}/state` and re-runs the reconciler. Reported errors are recorded in the audit log.
 
 This applies to **agents only** (the polling extension surface). Plugins are in-process and don't poll — they're called directly when state changes (per ADR-003), so there's no heartbeat path to optimise.
 

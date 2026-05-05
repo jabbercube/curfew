@@ -7,7 +7,7 @@ CLI- and (later) web-driven tool to manage screentime across the household. Buil
 1. **Modular** — each enforcement method is an independent agent or plugin.
 2. **API-first** — the core HTTP API is the contract. CLI, GUI, agents, and any future surface are all clients.
 3. **Docker-hosted core** — the user runs the core as a docker compose stack alongside other homelab services.
-4. **Pull-based agents, event-driven plugins** — agents (on-device) poll and reconcile on a timer; plugins (in-core) are called directly when state changes. Both self-heal through reboots, sleep, and network changes (see ADR-003).
+4. **Pull-based agents, event-driven plugins** — agents (on-device) poll and reconcile on a timer; plugins (in-core) are called directly when state changes. Agents self-heal through reboots, sleep, and network changes via re-polling; plugins self-heal through a safety-net resync that catches missed events after a curfew-core restart (see ADR-003).
 5. **Well-tested** — core, CLI, both SDKs (agent and plugin), and individual agents and plugins all have automated tests in CI.
 6. **Kernel-then-features progression** — build a complete kernel up front; layer features on top in any order.
 
@@ -66,7 +66,7 @@ The schema is created in the initial migration with all fields the system will e
 | `device_agents` | (device PK, type, config JSON) — the agent type installed on this device (one per device), with config (e.g. which Windows local user account to ACL) |
 | `agent_instances` | device (PK, FK→devices), last_heartbeat (nullable), last_seen_version. Runtime state; one row per `device_agents` row, created and deleted in the same transaction. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped). The kernel records this fact; it doesn't interpret stale heartbeats as an alert (a powered-off device looks the same as a broken agent without independent reachability data — see the Reachability monitoring feature) |
 | `agent_tokens` | token_hash (PK), device, created_at, revoked_at — bearer per device, used by the agent on that device to authenticate |
-| `plugins` | (type, instance_id) PK; config JSON; governs JSON list (user names, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`; instance_id is empty by default and only set when multiple instances of the same type are needed |
+| `plugins` | (type, instance_id) PK; config JSON; governs JSON list (user names, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`. `instance_id` is the literal string `"default"` unless the operator needs multiple instances of the same type, in which case they pick a name. URL paths use both segments (`/v1/plugins/{type}/{instance_id}`); the CLI defaults the instance_id to `default` so single-instance plugins read naturally (`curfew plugin pause adguard`) |
 | `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
 | `audit_log` | id (PK), actor, action, target, payload (JSON), occurred_at |
 | `manifests` | type (PK), version, sha256, agent_url — versioned **agent** artifacts (plugins are not distributed this way; they're files on disk) |
@@ -171,7 +171,7 @@ plugins/
     └── requirements.txt
 ```
 
-1. **Discovery** (at curfew-core startup): scan each directory in `CURFEW_PLUGINS_DIRS` in order. For each subdirectory: read `manifest.toml`, optionally `pip install -r requirements.txt` into curfew-core's shared Python environment, import `plugin.py`, find the class subclassing `Plugin`, register it under its `type` name. Each `plugin.py` must declare **exactly one** `Plugin` subclass — zero or multiple is a discovery error, the plugin is skipped, the error is logged and surfaced on `GET /v1/plugins/types`.
+1. **Discovery** (at curfew-core startup): scan each directory in `CURFEW_PLUGINS_DIRS` in order. For each subdirectory: read `manifest.toml`, optionally `pip install -r requirements.txt` into curfew-core's shared Python environment, import `plugin.py`, find the entry-point class, register it under the manifest's `type` name. **Entry-point selection:** if `plugin.py` declares exactly one class subclassing `Plugin`, use it. If it declares multiple subclasses (e.g. an internal `BaseAdGuardClient(Plugin)` plus a concrete `AdGuardPlugin(BaseAdGuardClient)`), the **leaf class** in the hierarchy wins. Zero subclasses is a discovery error; the plugin is skipped, the error logged and surfaced on `GET /v1/plugins/types`.
 2. **Assignment** (operator): `curfew plugin assign adguard --config '{"url": "..."}' --governs '["*"]'`. Validates config against the plugin's Pydantic schema, inserts a row in `plugins`, instantiates the plugin in memory. **Convention: secrets stay in env, not in config.** A plugin needing a secret declares an `*_env` field (e.g. `api_token_env: "ADGUARD_TOKEN"`) and reads `os.environ[name]` at runtime; the config row holds only the env-var name. This keeps `state.sqlite` and `GET /v1/plugins` free of plaintext secrets.
 3. **Reconciliation** (event-driven, async to the originating request): when state changes for a user the plugin governs (lock toggled, schedule fired, etc.), curfew-core schedules `reconcile()` calls on every governing plugin as background tasks. The originating API request returns immediately after the database write; the reconciles fire in the background. A reconcile failure is logged and recorded in the audit log but doesn't fail the originating request — slow plugins don't delay the operator. Operators check the audit log if they need to confirm reconcile succeeded.
 4. **Safety-net resync** (slow tick, default every 5 minutes): curfew-core walks all governed users and calls `reconcile()` on each registered plugin instance for each governed user. Catches missed events from restarts.
@@ -319,6 +319,7 @@ Single-row `settings` table with typed columns. The initial migration creates th
 | `agent_tick_seconds` | 60 | How often agents poll the core (heartbeat + state-hash check) |
 | `manifest_tick_seconds` | 3600 | How often agents check for code updates |
 | `plugin_resync_seconds` | 300 | Safety-net resync interval — core walks all governed users and re-calls each plugin's reconcile |
+| `plugin_reconcile_timeout_seconds` | 30 | Per-call timeout for `Plugin.reconcile()`; the call is cancelled and treated as a failure if it doesn't return in time |
 | `audit_retention_days` | 90 | Rolling window before audit rows are pruned |
 
 API: `GET /v1/settings` (read all), `PATCH /v1/settings` (update one or more). CLI: `curfew setting list | get | set`. Writes go through the audit log.
@@ -364,7 +365,7 @@ Agents (per-device extension surface)
   GET    /v1/devices/{device}/agent             fetch the agent installed on this device (type, config, last_heartbeat, last_seen_version)
   POST   /v1/devices/{device}/agent             body { type, config }; installs an agent on this device, mints a bearer, returns { token: { id, secret }, bootstrap }
   DELETE /v1/devices/{device}/agent             uninstall the agent (deletes device_agents + agent_instances rows, revokes tokens)
-  POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version, errors?: [...] }; returns { state_hash, agent_tick_seconds, ... }
+  POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version, errors?: [{kind, message, occurred_at}] }; returns { state_hash, agent_tick_seconds, ... }
   GET    /v1/devices/{device}/state             full state for this device's agent: scoped lock status, agent config, target apps, relevant app catalog entries
   POST   /v1/devices/{device}/activity          body { user, occurred_at, ... }; no-op until budget rule registered
   POST   /v1/devices/{device}/tokens            mint an additional bearer for this device; returns { id, secret }
@@ -374,9 +375,9 @@ Agents (per-device extension surface)
 Plugins (in-core extension surface)
   GET    /v1/plugins                            list assigned plugin instances + paused/governs/config
   GET    /v1/plugins/types                      list discovered plugin types from CURFEW_PLUGINS_DIRS + their config_schema
-  POST   /v1/plugins                            body { type, instance_id?, config, governs }; assigns a plugin
-  PATCH  /v1/plugins/{type}                     update config / governs / paused (use {type}:{instance_id} when not the default)
-  DELETE /v1/plugins/{type}                     unassign
+  POST   /v1/plugins                            body { type, instance_id?, config, governs }; assigns a plugin (instance_id defaults to "default")
+  PATCH  /v1/plugins/{type}/{instance_id}       update config / governs / paused for this instance
+  DELETE /v1/plugins/{type}/{instance_id}       unassign this instance
 
 Locks
   POST   /v1/users/{user}/lock                  manual lock
@@ -571,7 +572,7 @@ Future: `linux-agent`, embedded-device agents, etc.
 
 ## Plugins (in-core implementations)
 
-Drop-in Python plugins shipped with curfew (in `plugins/` in the repo, the default entry in `CURFEW_PLUGINS_DIRS`). Each is a folder with `manifest.toml` + `plugin.py`. Operator-authored third-party plugins live in any additional directory the operator adds to `CURFEW_PLUGINS_DIRS` — same shape, different origin.
+Drop-in Python plugins live in `plugins/` in the curfew repo (the default entry in `CURFEW_PLUGINS_DIRS`). Each is a folder with `manifest.toml` + `plugin.py`. Shipped plugins and operator-authored plugins live alongside each other in the same directory; operators who prefer keeping their own plugins outside the repo can append additional paths to `CURFEW_PLUGINS_DIRS`.
 
 - **`adguard`** — first in-core plugin; stress-tests plugin discovery + the resync path. DNS sinkhole via AdGuard Home REST API.
 - **`smart-plug`** — Tasmota/Kasa power control.

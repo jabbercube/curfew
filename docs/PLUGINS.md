@@ -101,8 +101,8 @@ httpx>=0.25
 
 ## What curfew-core does at startup
 
-1. Reads `CURFEW_PLUGINS_DIRS` (default: the bundled `plugins/` dir in the image; operators extend with extra colon-separated paths).
-2. For each subdirectory: opens `manifest.toml`, validates required fields, optionally `pip install -r requirements.txt`, imports `plugin.py`, finds the class subclassing `Plugin`, registers it under its `type` name. **Exactly one `Plugin` subclass per `plugin.py`** — zero or multiple is a discovery error and that plugin is skipped (with a clear error visible on `GET /v1/plugins/types`).
+1. Reads `CURFEW_PLUGINS_DIRS` (default: the curfew repo's `plugins/` directory; operators extend with extra colon-separated paths).
+2. For each subdirectory: opens `manifest.toml`, validates required fields, optionally `pip install -r requirements.txt`, imports `plugin.py`, finds the entry-point class, registers it under the manifest's `type` name. **Entry-point selection:** the leaf class in the `Plugin` subclass hierarchy. So a plugin can have its own internal helpers (e.g. `BaseAdGuardClient(Plugin)` for shared methods, then `AdGuardPlugin(BaseAdGuardClient)` as the actual implementation) — the leaf (`AdGuardPlugin`) is what gets registered. Zero `Plugin` subclasses is a discovery error; the plugin is skipped (with a clear error visible on `GET /v1/plugins/types`).
 3. Now there's a registry: `{"adguard": AdGuardPlugin, "smart_plug": SmartPlugPlugin, "wyze": WyzePlugin, ...}`.
 4. For each row in the `plugins` table (the operator's assignments): instantiate the plugin with the row's config, hold the instance in memory.
 
