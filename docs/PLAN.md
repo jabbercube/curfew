@@ -15,7 +15,7 @@ CLI- and (later) web-driven tool to manage screentime across the household. Buil
 
 ```
 +------------------+     +-----------------------+     +-----------------------------+
-| Parent's machine |     | Homelab host          |     | Each kid PC (Windows)       |
+| Operator machine |     | Homelab host          |     | Each managed PC (Windows)   |
 | (your laptop)    |     | (docker compose)      |     |                             |
 |                  |     |                       |     |                             |
 |  $ curfew lock   | --> |  curfew-core (FastAPI)| <-- |  agent.ps1                  |
@@ -33,9 +33,9 @@ CLI- and (later) web-driven tool to manage screentime across the household. Buil
 
 Three places code physically lives:
 
-- **Parent's machine** — CLI binary/script. Stateless. Each invocation is short-lived. Talks to the core's API over HTTPS.
+- **Operator machine** — CLI binary/script. Stateless. Each invocation is short-lived. Talks to the core's API over HTTPS.
 - **Homelab host** — one docker compose stack: a single FastAPI container serving the API, fronted by your existing Traefik. Persists `state.sqlite` in a docker volume.
-- **Each kid PC** — small PowerShell agent + a Windows Scheduled Task. Installed once via a bootstrap script. The agent fetches state from the API on each tick and reconciles local enforcement.
+- **Each managed PC** — small PowerShell agent + a Windows Scheduled Task. Installed once via a bootstrap script. The agent fetches state from the API on each tick and reconciles local enforcement.
 
 ## Plan shape: kernel + features
 
@@ -60,7 +60,7 @@ The schema is created in the initial migration with all fields the system will e
 
 | Table | Purpose |
 |-------|---------|
-| `users` | name (PK), role, managed (bool), target_apps (JSON list), schedule (JSON expr, nullable), budget_minutes (int, nullable) |
+| `users` | name (PK), role, managed (bool, default true), target_apps (JSON list), schedule (JSON expr, nullable), budget_minutes (int, nullable) |
 | `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
 | `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
 | `device_plugins` | (device, type, config JSON) — plugin types expected to govern this device, with per-instance config (e.g. the Windows local user account `windows-pc` should ACL) |
@@ -79,7 +79,7 @@ The schema is created in the initial migration with all fields the system will e
 |-------|----------------|
 | `name` | Stable identifier used in CLI/API/UI. Short string (`kid1`), not a real name. |
 | `role` | `member`, `manager`, or `admin`. Capabilities are cumulative: `member` has no operator powers; `manager` can lock/unlock managed users; `admin` is everything `manager` is plus can edit users, devices, apps, plugin assignments, and agent manifests. Future auth/RBAC keys off this. |
-| `managed` | Bool. Whether lock rules apply to this user. Independent of `role` — a teen `manager` could be `managed: true` (has lock control over siblings *and* their own rules apply); a houseguest could be `member, managed: false` (no powers, not subject to rules). When `false`, `GET /v1/users/{user}/status` always returns `{locked: false, reasons: []}` and the rule pipeline is skipped. |
+| `managed` | Bool, defaults to `true`. Whether lock rules apply to this user. Independent of `role` — a teen `manager` could be `managed: true` (has lock control over siblings *and* their own rules apply); a houseguest could be `member, managed: false` (no powers, not subject to rules). When `false`, `GET /v1/users/{user}/status` always returns `{locked: false, reasons: []}` and the rule pipeline is skipped. Operators typically opt out (`--managed false`) for managers, admins, and guests. |
 | `target_apps` | Apps that get blocked when this user is in a locked state (manual lock today; out-of-schedule and budget-exhausted in later phases). References keys in `apps`. |
 | `schedule` | Optional schedule expression (e.g. `"weekday 16:00-20:00"`). Read by the schedule-lock feature when registered. |
 | `budget_minutes` | Optional daily/weekly budget. Read by the budget-lock feature when registered. |
@@ -93,11 +93,11 @@ The schema is created in the initial migration with all fields the system will e
 | `type` | `pc | laptop | phone | tablet | console | tv`. Constrains which plugin types apply. |
 | `os` | `windows | macos | linux | ios | android`. Selects per-device plugin variants. |
 | `mac` | Network-layer identity, stable across IP changes. List, since a device commonly has multiple MACs (Wi-Fi + ethernet; randomized per network). Read by network-side plugins. |
-| `managed` | Whether curfew governs this device at all. Lets the inventory list parents' devices for completeness without putting them under policy. |
+| `managed` | Whether curfew governs this device at all. Lets the inventory list devices for completeness without putting them under policy (e.g. a manager's laptop tracked but not enforced). |
 
 **Why people *and* devices, not just users-with-a-list-of-devices:**
 
-- Schedules and budgets attach to **people**, not devices. One kid, two devices, one shared budget.
+- Schedules and budgets attach to **people**, not devices. One member, two devices, one shared budget.
 - Plugin coverage is **per-device** — DNS for the phone, OS-level lock for the PC. Different plugins, same person.
 - A device may change hands (hand-me-down PC) and its `owner` updates without rewriting policy.
 
@@ -107,7 +107,7 @@ The schema is created in the initial migration with all fields the system will e
 - Static-vs-dynamic IP — irrelevant; we key on MAC.
 - Hardware specs, purchase dates, warranty — asset-management territory.
 
-## Effective-state rule pipeline
+## Lock status rule pipeline
 
 The kernel computes lock status per scope. Two scopes ship in the kernel:
 
@@ -127,7 +127,7 @@ A *plugin instance* is the runtime entity. Instances are declared in inventory:
 - **Per-device plugins**: each `device_plugins(device, type)` row produces an instance named `<type>:<device>` (e.g. `windows-pc:gamingrig`).
 - **In-core plugins**: each `core_plugins(type, instance_id)` row produces an instance named `<type>` if singular, or `<type>:<instance_id>` if multiple (e.g. `adguard`, or `smart-plug:livingroom`).
 
-Each plugin type registers a **capability descriptor** at core startup, declaring which device `os` and `type` values it applies to, which scopes it supports (`user`, `shared`), and which config keys it requires. The descriptor lets the (future) GUI offer constrained dropdowns.
+Each plugin type registers a **capability descriptor** at core startup, declaring which device `os` and `type` values it applies to, which scopes it supports (`user`, `device`), and which config keys it requires. The descriptor lets the (future) GUI offer constrained dropdowns.
 
 Lifecycle:
 
@@ -171,7 +171,7 @@ The kernel also ships a **reference test plugin** — a no-op SDK consumer that 
 ## Authentication
 
 - **Plugin auth**: per-instance bearer tokens (ADR-006). Hashed at rest. Read scope is full state in the kernel; future tightening to scoped reads is a feature on top.
-- **Admin auth**: V1 uses a single admin bearer token from env var. The API surface is shaped so a future GUI can add session tokens (OAuth/local sessions) without renaming endpoints.
+- **Operator auth**: V1 uses a single **root bearer token** from env var, distinct from the `admin` user role (which is data-only in V1 — no way for a user with `role: admin` to authenticate yet). Per-user role-based auth (sessions tied to user records) is a feature on top of the kernel; the API surface is shaped to accept it without renames.
 
 ## Audit log
 
@@ -258,7 +258,7 @@ curfew/
 │   │   └── migrations/               # Alembic
 │   ├── curfew_cli/                   # CLI — thin HTTP client
 │   ├── curfew_plugin_sdk/            # Python plugin SDK
-│   └── curfew_plugin_powershell/     # PowerShell plugin SDK module
+│   └── curfew_plugin_powershell/     # PowerShell plugin SDK module (curfew-plugin.psm1)
 ├── plugins/
 │   └── windows-pc/
 │       ├── agent.ps1                 # the per-tick agent (uses the PowerShell SDK)
@@ -356,7 +356,7 @@ Each plugin is a new type with: a capability descriptor, an SDK consumer (Python
 - **`adguard`** (in-core, Python SDK) — first in-core plugin; stress-tests the in-core path. DNS sinkhole via AdGuard Home REST API.
 - **`smart-plug`** (in-core, Python SDK) — Tasmota/Kasa power control.
 - **`router-acl`** (in-core, Python SDK) — UniFi/OPNsense API.
-- **`tailscale-acl`** (in-core, Python SDK) — gate egress for tailnet kid devices.
+- **`tailscale-acl`** (in-core, Python SDK) — gate egress for managed devices on the tailnet.
 - **`macos-pc`** (per-device, Python SDK on macOS) — same primitives translated.
 
 ## GUI
@@ -392,6 +392,6 @@ Implementation-level decisions still pending — none are kernel-architectural:
 
 - macOS, Linux, or non-Windows PC enforcement (will come as plugins; not the first plugin).
 - Cloud-account integration (Microsoft Family Safety, Google Family Link).
-- Tamper-resistance against an admin-level kid (assumes kids run as standard Windows users).
+- Tamper-resistance against a managed user with OS-level admin privileges on their device (assumes managed users run as standard local users).
 - Real-time push (long-polling / SSE) — listed as a feature for completeness but no expected need.
 - Multi-tenant / multi-household support.
