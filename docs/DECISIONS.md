@@ -19,7 +19,7 @@ Short notes on the major design decisions and rejected alternatives. Captures th
 
 ## ADR-002: Pull-based plugin reconciliation (push deferred)
 
-**Decided:** plugins poll the API on a timer (default 60s) and reconcile their slice of state. Push (long-polling / SSE) deferred to V2+ as a pure addition.
+**Decided:** plugins poll the API on a timer (default 60s) and reconcile their slice of state. Push (long-polling / SSE) deferred to V5+ as a pure addition.
 
 **Why:**
 - Self-heals through reboots, sleep, and network changes. Kid PCs are unreliable; a push-first design fails silently when the host is unreachable at command time.

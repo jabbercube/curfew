@@ -42,7 +42,7 @@ Three places code physically lives:
 
 A plugin is anything that:
 
-1. **Authenticates** to the core API with a per-plugin bearer token.
+1. **Authenticates** to the core API with a per-instance bearer token.
 2. **Reads state** via `GET /v1/state/effective/{user}` (or a filtered variant).
 3. **Reconciles** its slice of the world to match. Idempotent — if state hasn't changed, no-op.
 4. **Heartbeats** on every tick (`POST /v1/plugins/{name}/heartbeat`) so the core can detect drift between expected instances (from `inventory.yaml`) and actual liveness (per ADR-008).
@@ -160,7 +160,7 @@ POST   /v1/plugins/{name}/heartbeat       # plugin liveness
 POST   /v1/admin/reload-inventory         # re-read inventory.yaml from disk
 ```
 
-V2 adds `/v1/users/{user}/schedule`, device-as-resource endpoints, and shared-device locking (`POST /v1/shared/lock`/`unlock`). V3 adds `/v1/users/{user}/budget` + `POST /v1/heartbeat` (activity tracking). V5+ adds per-device app overrides.
+V2 adds `/v1/users/{user}/schedule`, device-as-resource endpoints, and shared-device locking (`POST /v1/shared/lock`/`unlock`). V3 adds `/v1/users/{user}/budget` + `POST /v1/plugins/{name}/activity` (activity tracking, distinct from the liveness heartbeat). V5+ adds per-device app overrides.
 
 ## Repository layout
 
@@ -225,11 +225,11 @@ Pre-commit hooks for lint/format. Type hints required (`mypy --strict` for the c
 
 **Goal:** prove the full loop with one real plugin and a working CLI. No schedules, no UI.
 
-- **Core**: FastAPI service in a single docker container. `inventory.yaml` (mounted from a config volume) + `state.sqlite` (in a data volume). SQLModel + Alembic from day one. Per-plugin bearer auth (ADR-006). Endpoints: `GET /v1/state`, `GET /v1/state/effective/{user}`, `POST /v1/users/{user}/lock`, `POST /v1/users/{user}/unlock`, `GET /v1/plugins` (with drift status), `POST /v1/plugins/{name}/heartbeat`, `POST /v1/admin/reload-inventory`.
+- **Core**: FastAPI service in a single docker container. `inventory.yaml` (mounted from a config volume) + `state.sqlite` (in a data volume). SQLModel + Alembic from day one. Per-instance bearer auth (ADR-006). Endpoints: `GET /v1/state`, `GET /v1/state/effective/{user}`, `GET /v1/users`, `POST /v1/users/{user}/lock`, `POST /v1/users/{user}/unlock`, `GET /v1/plugins` (with drift status), `POST /v1/plugins/{name}/heartbeat`, `POST /v1/admin/reload-inventory`.
 - **CLI**: `curfew lock <user>`, `curfew unlock <user>`, `curfew status`. Reads config from `~/.config/curfew/config` (API URL + bearer).
 - **Plugin: `windows-pc`**: PowerShell agent + Scheduled Task. Polls every minute. Applies/removes NTFS deny-execute on configured .exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes. Self-updates from `/plugins/windows-pc/agent.ps1` on the core.
-- **Bootstrap**: one-line PowerShell installer registers the scheduled task, drops `agent.config` (API URL, bearer, instance name e.g. `windows-pc:gamingrig`).
-- **Acceptance**: from your laptop, `curfew lock kid1` → within 60 seconds, Steam can't launch on the kid PC and YouTube is blocked in Chrome/Edge. `curfew unlock kid1` reverses it.
+- **Bootstrap**: one-line PowerShell installer registers the scheduled task, drops `agent.config` (API URL, bearer, instance name e.g. `windows-pc:gamingrig`). V1 token issuance is manual — the operator generates a token (one-shot helper or `inventory.yaml` seed) and pastes it into the bootstrap command; a structured token-management CLI lands in V2 alongside the device endpoints.
+- **Acceptance**: from your laptop, `curfew lock kid1` → within 60 seconds, Steam and Minecraft can't launch on the kid PC and YouTube is blocked in Chrome/Edge (every app in kid1's `target_apps`). `curfew unlock kid1` reverses it.
 - **Tests**: full pytest suite green; Pester tests green; e2e test (`docker compose up` + CLI round-trip) green in CI.
 
 ### V2 — schedules + device endpoints + shared-device locking (additive)
@@ -273,7 +273,7 @@ Deferred features (no plugin work):
 Resolved during the reconciliation pass — see DECISIONS.md for details:
 
 - ~~State backend~~ → SQLite from V1, with `inventory.yaml` separate (ADR-005, ADR-007).
-- ~~Auth model~~ → per-plugin bearer tokens from day one (ADR-006).
+- ~~Auth model~~ → per-instance bearer tokens from day one (ADR-006).
 - ~~Plugin assignment direction~~ → inventory-as-desired-state + heartbeats (ADR-008).
 - ~~User vs people terminology~~ → `users` with `role` field.
 
