@@ -101,7 +101,7 @@ A plugin is a Python class subclassing `Plugin` from the plugin SDK. Curfew-core
 
 **Decided:** desired state is declared in the database; runtime data either projects from it or is irrelevant.
 
-- **Agents:** `device_agents(device, type, config)` declares what's expected to be running on each device. `agent_instances(device, last_heartbeat, last_seen_version)` is a derived projection — created and deleted in the same transaction as the `device_agents` row. The instance row holds runtime fields; the assignment row holds desired state. The core compares expected (from `device_agents`) to actual (from heartbeats) and surfaces drift on `GET /v1/agents`.
+- **Agents:** `device_agents(device, type, config)` declares what's expected to be running on each device. `agent_instances(device, last_heartbeat, last_seen_version)` is a derived projection — created and deleted in the same transaction as the `device_agents` row. The instance row holds runtime fields; the assignment row holds desired state. The core records `last_heartbeat` on each tick and exposes it on `GET /v1/agents`. The kernel deliberately does *not* paint stale heartbeats as an alert — a powered-off device looks identical to a broken agent without independent reachability evidence (see the Reachability monitoring feature in PLAN.md).
 - **Plugins:** `plugins(type, instance_id, config, governs, paused)` declares which plugins are assigned and how. There's no separate runtime-state table because plugins are in-process — their liveness *is* the core's. An assigned-but-paused plugin has its row but is skipped during reconciliation.
 
 **Rejected:**
@@ -204,7 +204,7 @@ A plugin author writes a Python class. The plugin SDK provides types and helpers
 
 ## ADR-012: Agent heartbeats carry a state hash for change detection
 
-**Decided:** every agent heartbeat (`POST /v1/devices/{device}/heartbeat`) carries the agent's last-known state hash; the server returns its current hash plus a small set of immediate-effect settings (`agent_tick_seconds`, `drift_threshold_seconds`, etc.). If the hashes match, the agent has nothing new to do. If they differ, the agent fetches full state via `GET /v1/devices/{device}/state` and re-runs the reconciler.
+**Decided:** every agent heartbeat (`POST /v1/devices/{device}/heartbeat`) carries the agent's last-known state hash; the server returns its current hash plus a small set of immediate-effect settings (`agent_tick_seconds`, etc.). If the hashes match, the agent has nothing new to do. If they differ, the agent fetches full state via `GET /v1/devices/{device}/state` and re-runs the reconciler.
 
 This applies to **agents only** (the polling extension surface). Plugins are in-process and don't poll — they're called directly when state changes (per ADR-003), so there's no heartbeat path to optimise.
 

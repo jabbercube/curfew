@@ -67,7 +67,7 @@ That command:
 Each tick:
 - Compute its current state hash (cached from last tick).
 - POST `/v1/devices/gamingrig/heartbeat` with `{state_hash, agent_version}`.
-- Receive `{state_hash, agent_tick_seconds, drift_threshold_seconds, ...}` back.
+- Receive `{state_hash, agent_tick_seconds, ...}` back.
 - If hashes match: nothing changed. Maybe report any local errors via the next heartbeat. Wait for next tick.
 - If hashes differ: GET `/v1/devices/gamingrig/state` for the full picture (lock status, agent config, target apps, app catalog entries). Update local cache. Run the reconciler.
 - Reconciler given `{locked: true}` + target_apps: apply NTFS deny-execute on the configured exe paths, set `URLBlocklist` registry policy, kill matching running processes.
@@ -116,20 +116,17 @@ The exact API surface is implementation detail — what matters is that the agen
 
 ## What can go wrong
 
-### Drift
+### Last-seen and the limits of inference
 
-`GET /v1/agents` reports each agent in one of three states:
+`GET /v1/agents` includes each agent's `last_heartbeat` timestamp (or `null` if it has never reported in — assigned but not bootstrapped). The kernel doesn't interpret old timestamps as an alert: a powered-off PC has the same signature as a broken agent. Without independent evidence that the device is on, "no recent heartbeat" could mean either thing, and alerting on it produces noise.
 
-- **`pending`** — assigned but `last_heartbeat IS NULL`. The operator ran `curfew agent install` but hasn't run the bootstrap on the device yet. Not an alert.
-- **`healthy`** — heartbeating within `drift_threshold_seconds`.
-- **`drifted`** — heartbeated at least once but not within the threshold. **This is the alert state.**
+The cases that genuinely matter:
 
-If an agent transitions to drifted (PC off, agent crashed, network down), the lock state in curfew-core is *unchanged* — the database still says kid1 is locked, but the device isn't enforcing because nothing's running there. **Drift = unenforced.**
+- **Device off** — fine. Nothing to enforce, nothing to alert on.
+- **Device on, agent running, agent can't reach the core** — handled agent-side by **auto-lock on disconnect** (a feature; see PLAN.md). The agent tracks "time since last successful fetch" and after `failclosed_after_seconds` invokes its reconciler with `{locked: true, reasons: [{kind: "failclosed"}]}`. The device stays locked even when offline from curfew's perspective.
+- **Device on, agent broken or absent** — the actual enforcement-bypass case. To detect this, the core needs to know the device is on independently of the heartbeat. That's the **reachability monitoring** feature (also in PLAN.md): probe each device's `mac` or IP on a slow tick, alert when a reachable device hasn't heartbeated.
 
-Two mitigations exist as features (see PLAN.md):
-
-- **Auto-lock on disconnect** — the agent tracks "time since last successful state fetch" and trips the reconciler with `{locked: true, reasons: [{kind: "failclosed"}]}` after `failclosed_after_seconds`. Even when the agent can't reach the core, it stays locked. Setting defaults to `0` (disabled).
-- **Drift notifications** — a webhook or polled `?drifted=true` query so the operator gets pinged when an agent goes quiet.
+Until reachability monitoring lands, the operator inspects `GET /v1/agents` manually and uses last-seen as a hint, not an alert.
 
 ### Token compromise
 
@@ -147,7 +144,7 @@ Suppose you want a `linux-pc` agent. Steps:
 2. **Write the reconciler.** Subclass the SDK's agent class, implement `reconcile(state)`, do whatever Linux-specific blocking/killing you want (iptables to localhost, kill processes, deny execute via setfacl, etc.).
 3. **Build a bootstrap installer** — a small shell script that the operator runs on the target machine. It fetches the manifest, verifies hash, installs, registers a systemd timer (or cron, or whatever).
 4. **Publish a version.** `curfew agent publish linux-pc 1.0.0 ./linux-pc-agent.tar` ships the artifact + hash to curfew-core. From now on, `curfew agent install linux-pc <device>` will work.
-5. **Test it** against `reftest_agent`'s patterns — drop assignment, heartbeat appears, drift surfaces if you stop the agent, lock toggles propagate within a tick.
+5. **Test it** against `reftest_agent`'s patterns — drop assignment, heartbeat appears, `last_heartbeat` advances on each tick, lock toggles propagate within a tick.
 
 The agent doesn't need to know about plugins or the rule pipeline. It only sees `{locked, reasons, target_apps, config}` and the reconciler dispatches.
 

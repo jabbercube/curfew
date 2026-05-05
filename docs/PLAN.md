@@ -64,7 +64,7 @@ The schema is created in the initial migration with all fields the system will e
 | `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
 | `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
 | `device_agents` | (device PK, type, config JSON) — the agent type installed on this device (one per device), with config (e.g. which Windows local user account to ACL) |
-| `agent_instances` | device (PK, FK→devices), last_heartbeat (nullable), last_seen_version. Runtime state; one row per `device_agents` row, created and deleted in the same transaction. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped) — distinct from "drifted" (heartbeated at least once, then stopped) |
+| `agent_instances` | device (PK, FK→devices), last_heartbeat (nullable), last_seen_version. Runtime state; one row per `device_agents` row, created and deleted in the same transaction. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped). The kernel records this fact; it doesn't interpret stale heartbeats as an alert (a powered-off device looks the same as a broken agent without independent reachability data — see the Reachability monitoring feature) |
 | `agent_tokens` | token_hash (PK), device, created_at, revoked_at — bearer per device, used by the agent on that device to authenticate |
 | `plugins` | (type, instance_id) PK; config JSON; governs JSON list (user names, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`; instance_id is empty by default and only set when multiple instances of the same type are needed |
 | `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
@@ -147,7 +147,7 @@ One agent per device. The agent code is `windows-pc-agent`, `macos-pc-agent`, et
    - Prints a bootstrap one-liner for the operator to run on the device.
 2. Operator runs the bootstrap on the device. It fetches the agent code via the versioned manifest (`GET /v1/agents/{type}/manifest`), verifies SHA-256, installs, registers a scheduled task / launchd / cron job.
 3. Agent heartbeats every tick (`POST /v1/devices/{device}/heartbeat`) carrying its last-known state hash. If the server's hash differs, the agent fetches `GET /v1/devices/{device}/state` and re-runs its reconciler. (See ADR-012.)
-4. Core surfaces three states on `GET /v1/agents`: `pending` (assigned but `last_heartbeat IS NULL` — bootstrap not run yet), `healthy` (heartbeated within `drift_threshold_seconds`), `drifted` (heartbeated at least once but not within the threshold). Drift is the alert; pending is the "operator hasn't finished installing yet" state and shouldn't fire alerts.
+4. Core records `last_heartbeat` on each tick. `GET /v1/agents` returns `last_heartbeat` (and `last_heartbeat IS NULL` if the agent has never reported in yet — assigned but not bootstrapped). The kernel doesn't interpret this as an alert: a powered-off device looks the same as a broken agent without an independent presence signal. Real "device is on but agent isn't checking in" alerting is the Reachability monitoring feature.
 5. Removal: `curfew agent uninstall gamingrig` → deletes the `device_agents` row → `agent_instances` cascade-deletes → outstanding tokens revoked → next agent tick gets 401 → operator removes the local install.
 
 **Drift = unenforced.** An agent that isn't heartbeating isn't enforcing. The database knows the user is locked; the device doesn't. Drift surfaces on `GET /v1/agents` for the operator to investigate. Optional fail-closed agent behaviour (auto-lock on disconnect) is a feature on top — see "Auto-lock on disconnect."
@@ -214,7 +214,7 @@ Both expose:
 - Error reporting back to core (via heartbeat payload)
 - Config bootstrap (device name, API URL, token)
 
-**Hash-based change detection.** Each heartbeat carries the agent's last-known state hash; the server returns its current hash plus a small set of immediate-effect settings (`tick_seconds`, `drift_threshold_seconds`, etc.). Match → no work this tick. Mismatch → agent fetches `GET /v1/devices/{device}/state` (lock status, per-device config, target apps, relevant app catalog entries) and re-runs the reconciler. Heartbeats stay tiny; state pulls happen only when something actually changed.
+**Hash-based change detection.** Each heartbeat carries the agent's last-known state hash; the server returns its current hash plus a small set of immediate-effect settings (`agent_tick_seconds`, etc.). Match → no work this tick. Mismatch → agent fetches `GET /v1/devices/{device}/state` (lock status, per-device config, target apps, relevant app catalog entries) and re-runs the reconciler. Heartbeats stay tiny; state pulls happen only when something actually changed.
 
 ### Plugin SDK (for in-core plugins)
 
@@ -311,7 +311,6 @@ Single-row `settings` table with typed columns. The initial migration creates th
 | `agent_tick_seconds` | 60 | How often agents poll the core (heartbeat + state-hash check) |
 | `manifest_tick_seconds` | 3600 | How often agents check for code updates |
 | `plugin_resync_seconds` | 300 | Safety-net resync interval — core walks all governed users and re-calls each plugin's reconcile |
-| `drift_threshold_seconds` | 180 | An agent counts as drifted after this long without a heartbeat |
 | `audit_retention_days` | 90 | Rolling window before audit rows are pruned |
 
 API: `GET /v1/settings` (read all), `PATCH /v1/settings` (update one or more). CLI: `curfew setting list | get | set`. Writes go through the audit log.
@@ -352,10 +351,10 @@ User / device / app CRUD
   DELETE /v1/apps/{app}                         delete
 
 Agents (per-device extension surface)
-  GET    /v1/agents                             list installed agents + heartbeat status (drift visible here)
+  GET    /v1/agents                             list installed agents with last_heartbeat (consumer interprets staleness)
   POST   /v1/devices/{device}/agent             body { type, config }; installs an agent on this device, mints a bearer, returns { token: { id, secret }, bootstrap }
   DELETE /v1/devices/{device}/agent             uninstall the agent (deletes device_agents + agent_instances rows, revokes tokens)
-  POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version }; returns { state_hash, tick_seconds, drift_threshold_seconds, ... }
+  POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version }; returns { state_hash, agent_tick_seconds, ... }
   GET    /v1/devices/{device}/state             full state for this device's agent: scoped lock status, agent config, target apps, relevant app catalog entries
   POST   /v1/devices/{device}/activity          body { user, occurred_at, ... }; no-op until budget rule registered
   POST   /v1/devices/{device}/tokens            mint an additional bearer for this device; returns { id, secret }
@@ -398,7 +397,7 @@ curfew user             add | list | show | edit | rm
 curfew device           add | list | show | edit | rm
 curfew app              add | list | show | edit | rm
 
-curfew agent            install <type> <device> | uninstall <device> | list | drift
+curfew agent            install <type> <device> | uninstall <device> | list
 curfew agent token      mint <device> | list <device> | revoke <device> <id>
 curfew agent publish    <type> <version> <file>             # publish a new version of agent code
 
@@ -479,7 +478,7 @@ curfew/
 | Agent update flow | pytest + Pester | Manifest endpoint, hash verification, atomic swap, rollback on failed swap. |
 | CLI | pytest + httpx mocking | Each command, exit codes, output formatting. |
 | Audit log | pytest | Every API write produces a row; payloads are structured. |
-| End-to-end | pytest + docker compose | Spin up the stack, run CLI, observe an agent heartbeat + drift, observe a plugin reconcile being called on lock. |
+| End-to-end | pytest + docker compose | Spin up the stack, run CLI, observe an agent heartbeat (and last_heartbeat advancing), observe a plugin reconcile being called on lock. |
 
 CI runs on every push:
 - **Linux runner**: ruff + mypy + pytest (unit, API, CLI, e2e with docker compose).
@@ -498,7 +497,7 @@ The kernel is "done" when both extension surfaces work end-to-end. Two reference
 3. CLI installs the reference agent (`curfew agent install reftest gamingrig --config '{}'`); verify the `device_agents` and `agent_instances` rows are created in the same transaction; CLI prints the secret once and the bootstrap one-liner.
 4. The reference agent runs the bootstrap. It fetches the manifest, verifies SHA-256, installs.
 5. Agent heartbeats; `GET /v1/agents` shows it healthy.
-6. Stop the agent; `GET /v1/agents` shows drift within 2 ticks.
+6. Stop the agent; `GET /v1/agents` shows the agent's `last_heartbeat` no longer advancing (interpretation is the consumer's job — the kernel just records).
 7. CLI locks the user (`curfew lock kid1`); the manual_lock rule fires; `GET /v1/users/kid1/status` returns `{locked: true, reasons: [{kind: "manual_lock"}]}`.
 8. State-hash mismatch on next heartbeat → agent pulls `/state` → reads lock status → writes its sentinel file.
 9. CLI unlocks; agent clears its sentinel.
@@ -579,14 +578,23 @@ Implementation lives in the agent SDK — both Python and PowerShell flavours tr
 
 (Plugins don't need this — they're in-process; "disconnect" is meaningless for them.)
 
-## Drift notifications
+## Reachability monitoring
 
-Operator alerting when an agent is drifted past `drift_threshold_seconds`. Two implementation options, neither committed:
+The kernel records `last_heartbeat` on each agent but doesn't interpret stale heartbeats as an alert — a powered-off PC looks identical to a broken agent without independent evidence the device is online.
 
-- **Outbound webhook** — `drift_webhook_url` setting; the core POSTs a small payload when an agent drifts. Operator pipes into Slack / email / whatever.
-- **Polled query** — `GET /v1/agents?drifted=true` is enough for an external cron to ping the operator.
+This feature adds that independent evidence by probing devices on the homelab LAN (ARP via the device's `mac` field, ICMP ping, or watching DHCP leases — exact mechanism TBD when the feature lands). The core records reachability separately from heartbeats. The real alert state is then **device is reachable AND no recent heartbeat** — the kid PC is on, the agent isn't running, enforcement is bypassed.
 
-Until either lands, the operator monitors `GET /v1/agents` manually. Auto-lock on disconnect (above) is the primary mitigation; notifications are the secondary signal so the operator knows enforcement has switched to fail-closed mode.
+Settings the feature would add (sketch):
+
+- `reachability_probe_seconds` — how often to probe each device.
+- `reachability_alert_threshold_seconds` — how long after a probe-vs-heartbeat divergence before alerting.
+
+Notification channels (also part of this feature):
+
+- **Outbound webhook** — `reachability_webhook_url` setting; the core POSTs when a probed-online device hasn't heartbeated in time. Operator pipes into Slack / email / whatever.
+- **Polled query** — `GET /v1/agents?stale=true` (or similar) for an external cron.
+
+Auto-lock on disconnect (above) is the agent-side counterpart and the primary mitigation: an agent that can't reach the core fails closed locally. Reachability monitoring is the operator-side signal — it tells you when an agent that *should* be running isn't.
 
 (Plugins are in-process; if they crash, curfew-core itself is having a bad time and the homelab orchestrator notices that the container is unhealthy.)
 
