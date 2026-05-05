@@ -145,7 +145,7 @@ Rules implement a single interface, declare their scope at registration, and ret
 
 - The agent fetch path is a remote-code-execution channel from the core to every privileged agent. There is no acceptable version of this without integrity checks.
 - Versioning makes rollbacks possible and update cadence explicit; hash verification closes the MITM gap with no signing infrastructure required.
-- Adding versioning + hash verification later means refitting every existing plugin's update path. Cheaper to ship it once.
+- Adding versioning + hash verification later means refitting every existing agent's update path. Cheaper to ship it once.
 
 **Future tightening (a feature, not the kernel):** manifest signing with a long-lived private key on the core and a public key embedded in the bootstrap. Closes the gap if the core itself is partially compromised.
 
@@ -228,23 +228,19 @@ Any operator action that affects the device — lock toggle, settings change, co
 
 ## ADR-013: Plugins are drop-in Python modules in `CURFEW_PLUGINS_DIRS`
 
-**Decided:** in-core plugins are Python packages dropped into any directory listed in `CURFEW_PLUGINS_DIRS` — a colon-separated list (PATH-style). Curfew-core scans each directory in order at startup, reads each subdirectory's `manifest.toml`, optionally installs `requirements.txt` into the shared Python environment, imports `plugin.py`, finds the class subclassing `Plugin`, and registers it under its `type` name. If the same `type` is declared in multiple dirs, later entries win (operator-mounted dirs can override shipped plugins).
+**Decided:** in-core plugins are Python packages dropped into any directory listed in `CURFEW_PLUGINS_DIRS` — a colon-separated list (PATH-style). Curfew-core scans each directory in order at startup, reads each subdirectory's `manifest.toml`, optionally installs `requirements.txt` into the shared Python environment, imports `plugin.py`, finds the class subclassing `Plugin`, and registers it under its `type` name. If the same `type` is declared in multiple dirs, later entries win.
 
-The default value of `CURFEW_PLUGINS_DIRS` is the bundled `plugins/` directory inside the curfew-core image — so curfew ships with `adguard`, `smart-plug`, etc. discoverable out of the box. Operators install third-party plugins by mounting another directory into the container and appending its path:
-
-```
-CURFEW_PLUGINS_DIRS=/usr/lib/curfew/plugins:/etc/curfew/plugins
-```
+The default value of `CURFEW_PLUGINS_DIRS` is the curfew repo's `plugins/` directory — so curfew ships with `adguard`, `smart-plug`, etc. discoverable out of the box, and operator-authored plugins drop in alongside them. Operators who prefer keeping their plugins outside the repo can append additional paths.
 
 This follows the pattern used by Home Assistant `custom_components`, MkDocs entry points, Django apps, pytest plugins via pluggy, and similar Python-extensible frameworks.
 
 ```
 plugins/
-├── adguard/
-│   ├── manifest.toml      # type, name, version, config_schema, description
-│   ├── plugin.py          # class AdGuardPlugin(Plugin): async def reconcile(...)
-│   └── requirements.txt   # optional pip deps
-└── wyze/                  # operator-authored, in a separate dir
+├── adguard/                  # ours
+│   ├── manifest.toml         # type, name, version, config_schema, description
+│   ├── plugin.py             # class AdGuardPlugin(Plugin): async def reconcile(...)
+│   └── requirements.txt      # optional pip deps
+└── wyze/                     # operator-authored
     ├── manifest.toml
     ├── plugin.py
     └── requirements.txt

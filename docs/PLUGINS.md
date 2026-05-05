@@ -23,26 +23,24 @@ The split exists because of physics, not preference. A kid PC can't be reached f
 
 ## What a plugin folder looks like
 
-Each entry in `CURFEW_PLUGINS_DIRS` is a directory holding one subdirectory per plugin type. The default value points at the curfew repo's bundled `plugins/` directory inside the docker image — that's where the shipped plugins (`adguard`, `smart_plug`, etc.) live. Operators add more directories (e.g. a mounted `/etc/curfew/plugins/` volume) to install third-party plugins:
+Each entry in `CURFEW_PLUGINS_DIRS` is a directory holding one subdirectory per plugin type. The default value points at the curfew repo's `plugins/` directory — that's where shipped plugins (`adguard`, `smart_plug`, etc.) and any operator-authored plugins live:
 
 ```
-# Bundled (read-only, baked into the curfew-core image)
-/usr/lib/curfew/plugins/
+plugins/
 ├── adguard/                          # ours
 │   ├── manifest.toml
 │   ├── plugin.py
 │   └── requirements.txt              # optional
-└── smart_plug/                       # ours
-    ├── manifest.toml
-    └── plugin.py
-
-# Operator-mounted (writable; mounted from a docker volume)
-/etc/curfew/plugins/
-└── wyze/                             # operator-authored, third-party
+├── smart_plug/                       # ours
+│   ├── manifest.toml
+│   └── plugin.py
+└── wyze/                             # operator-authored
     ├── manifest.toml
     ├── plugin.py
     └── requirements.txt
 ```
+
+Operators who want to keep their plugins outside the curfew repo can add more directories to `CURFEW_PLUGINS_DIRS`; same shape, different filesystem location.
 
 Each subdirectory is a plugin type. The directory name doesn't have to match the type, but conventionally does.
 

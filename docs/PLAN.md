@@ -154,22 +154,18 @@ One agent per device. The agent code is `windows-agent`, `macos-agent`, etc. —
 
 ## Plugin lifecycle
 
-Plugins are Python modules dropped into any directory listed in `CURFEW_PLUGINS_DIRS` — a colon-separated list of paths (PATH-style). The default is the bundled `plugins/` directory inside the curfew-core image; operators add more entries to install third-party plugins (e.g. `CURFEW_PLUGINS_DIRS=/usr/lib/curfew/plugins:/etc/curfew/plugins`). Directories are scanned in order; if the same `type` is declared in two of them, the later entry wins (so operator-mounted dirs can override shipped plugins). Each subdirectory is one plugin type.
+Plugins are Python modules dropped into any directory listed in `CURFEW_PLUGINS_DIRS` — a colon-separated list of paths (PATH-style). The default is the curfew repo's `plugins/` directory. Operators can add more entries to install third-party plugins from elsewhere; directories are scanned in order, and if the same `type` is declared in two of them the later entry wins. Each subdirectory is one plugin type.
 
 ```
-# Bundled (read-only, baked into the curfew-core image)
-/usr/lib/curfew/plugins/
-├── adguard/
-│   ├── manifest.toml      # type, name, version, config_schema, description
-│   ├── plugin.py          # subclasses Plugin, implements reconcile()
-│   └── requirements.txt   # optional pip deps
-└── smart_plug/
-    ├── manifest.toml
-    └── plugin.py
-
-# Operator-mounted (writable; mounted from a docker volume)
-/etc/curfew/plugins/
-└── wyze/                  # operator-authored, third-party
+plugins/
+├── adguard/                  # ours
+│   ├── manifest.toml         # type, name, version, config_schema, description
+│   ├── plugin.py             # subclasses Plugin, implements reconcile()
+│   └── requirements.txt      # optional pip deps
+├── smart_plug/               # ours
+│   ├── manifest.toml
+│   └── plugin.py
+└── wyze/                     # operator-authored
     ├── manifest.toml
     ├── plugin.py
     └── requirements.txt
@@ -181,6 +177,14 @@ Plugins are Python modules dropped into any directory listed in `CURFEW_PLUGINS_
 4. **Safety-net resync** (slow tick, default every 5 minutes): curfew-core walks all governed users and calls `reconcile()` on each registered plugin instance for each governed user. Catches missed events from restarts.
 5. **Pause / unpause**: `curfew plugin pause adguard` flips a `paused` flag. The core stops calling reconcile until unpaused; the instance stays loaded and config is preserved.
 6. **Removal**: `curfew plugin unassign adguard` deletes the row, drops the in-memory instance.
+
+**Plugin config update — decision deferred:** when an operator `PATCH`es a plugin's config, the in-memory instance was constructed with the old config. The kernel needs to handle this; options when implementation gets here:
+
+- **Re-instantiate on PATCH.** Discard the in-memory instance, build a new one with the new config, swap in. Operator gets new config without a restart. Plugin's `__init__` runs again — any open connections or resources need to be re-established each time.
+- **Plugin reads config dynamically.** `self.config` is mutable on the instance; the plugin reads it fresh on each reconcile. Forces every plugin author to remember to read config fresh each time.
+- **Restart required.** PATCH updates the row only; nothing in memory changes until curfew-core restarts.
+
+The kernel commits to none of the above; pick when the trade-off is concrete (probably driven by the first plugin that holds expensive long-lived state).
 
 Plugins don't heartbeat — they're in-process; their liveness is the core's. Plugins don't have tokens — there's no network boundary to authenticate. Adding new plugin code (a new subdirectory in one of the `CURFEW_PLUGINS_DIRS`) requires a curfew-core restart to pick up; toggling existing plugins doesn't.
 
@@ -300,7 +304,7 @@ What lives in config:
 | `CURFEW_ROOT_TOKEN` | operator bearer; env-only, never in `config.json` |
 | `CURFEW_LISTEN_HOST` / `CURFEW_LISTEN_PORT` | bind address for the FastAPI server |
 | `CURFEW_AGENT_BASE_URL` | public URL agents call back to (Traefik-fronted hostname) |
-| `CURFEW_PLUGINS_DIRS` | colon-separated list of directories scanned for in-core plugins at startup. Default: the bundled `plugins/` directory in the curfew-core image. Operators extend by appending paths (e.g. `CURFEW_PLUGINS_DIRS=/usr/lib/curfew/plugins:/etc/curfew/plugins`). Later entries override earlier on duplicate `type`. |
+| `CURFEW_PLUGINS_DIRS` | colon-separated list of directories scanned for in-core plugins at startup. Default: the curfew repo's `plugins/` directory. Operators can extend by appending paths to install third-party plugins from elsewhere. Later entries override earlier on duplicate `type`. |
 | `CURFEW_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
 | `CURFEW_CORS_ORIGINS` | allowed origins for the future GUI |
 
@@ -499,8 +503,8 @@ The kernel is "done" when both extension surfaces work end-to-end. Two reference
 **Agent path:**
 
 1. CLI creates a user (`curfew user add kid1 --role member`) and a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`).
-2. CLI publishes the reference agent's first version (`curfew agent publish reftest 1.0.0 ./reftest_agent.tar`).
-3. CLI installs the reference agent (`curfew agent install reftest gamingrig --config '{}'`); verify the `device_agents` and `agent_instances` rows are created in the same transaction; CLI prints the secret once and the bootstrap one-liner.
+2. CLI publishes the reference agent's first version (`curfew agent publish reftest_agent 1.0.0 ./reftest_agent.tar`).
+3. CLI installs the reference agent (`curfew agent install reftest_agent gamingrig --config '{}'`); verify the `device_agents` and `agent_instances` rows are created in the same transaction; CLI prints the secret once and the bootstrap one-liner.
 4. The reference agent runs the bootstrap. It fetches the manifest, verifies SHA-256, installs.
 5. Agent heartbeats; `GET /v1/agents` shows `last_heartbeat` advancing on each tick.
 6. Stop the agent; `GET /v1/agents` shows the agent's `last_heartbeat` no longer advancing (interpretation is the consumer's job — the kernel just records).
@@ -563,7 +567,7 @@ On-device agent implementations. Each is a new agent type — a published agent 
 - **`windows-agent`** (`curfew-agent-sdk-powershell`) — first agent; stress-tests the agent contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
 - **`macos-agent`** (`curfew_agent_sdk_python`) — same primitives translated for macOS.
 
-Future: `linux-pc`, embedded-device agents, etc.
+Future: `linux-agent`, embedded-device agents, etc.
 
 ## Plugins (in-core implementations)
 
