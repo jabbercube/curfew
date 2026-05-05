@@ -127,7 +127,7 @@ Rules implement a single interface, declare their scope at registration, and ret
 
 ## ADR-010: A plugin SDK is part of the kernel
 
-**Decided:** the kernel ships a Python SDK (`curfew_plugin_sdk`) and a PowerShell module (`curfew-plugin.psm1`) that handle polling, heartbeating, retry/backoff, hash-verified self-update, and error reporting. A plugin's business logic is the reconciler — given the lock status, do the right thing. The SDK handles everything else.
+**Decided:** the kernel ships a Python SDK (`curfew_plugin_sdk_python`) and a PowerShell module (`curfew-plugin-sdk-powershell`) that handle polling, heartbeating, retry/backoff, hash-verified self-update, and error reporting. A plugin's business logic is the reconciler — given the lock status, do the right thing. The SDK handles everything else.
 
 **Rejected:** each plugin rolls its own loop.
 
@@ -136,3 +136,24 @@ Rules implement a single interface, declare their scope at registration, and ret
 - Six expected plugins → six bug surfaces for the same boilerplate. Inconsistent retry semantics, inconsistent self-update mechanics, inconsistent error reporting are the predictable outcome.
 - The SDK *shapes* the plugin contract. Adding it later effectively rewrites the contract retroactively (every existing plugin migrates). Cheaper to ship it once and have every plugin conform from day one.
 - `windows-pc` is the first SDK consumer and stress-tests the contract before any second plugin starts.
+
+## ADR-011: Config and settings are separate surfaces
+
+**Decided:** the curfew-core API service has two surfaces for tunable values:
+
+- **Config** is boot-time, env-and-file driven, immutable for the process. Loaded in precedence order: process env > `.env` (loaded into env) > `config.json` > built-in defaults. Implemented via Pydantic v2 `BaseSettings`. Used for values needed *before* the database opens (db path, listen address, root token).
+- **Settings** are runtime-mutable, stored in a single-row `settings` table, edited through the API/CLI. No restart required. Used for operational knobs (tick rates, retention windows, thresholds).
+
+**Rejected:**
+
+- **Everything in env.** Operators can't change values without a redeploy; no audit trail of who changed what; settings drift across replicas if scaled.
+- **Everything in the database.** The server can't open the database until it knows where it lives — at minimum `CURFEW_DB_PATH` has to exist before the database does.
+- **Single config file with both startup and runtime knobs.** Same chicken-and-egg as above for db path; plus runtime mutation of a JSON file by multiple writers (CLI + future GUI) reintroduces the locking problems ADR-002 rejected.
+
+**Why split:**
+
+- The chicken-and-egg cleanly resolves: config is what's needed to *open* the database; settings are what's stored *in* the database.
+- Operators can change tick rates and thresholds via the CLI/GUI without redeploys, and writes go through the audit log so the change is recorded.
+- Secrets stay in env; secrets never touch `state.sqlite`. `config.json` can be committed or templated since it never holds the root token.
+
+**Convention:** `.env` is for local-dev convenience (loaded automatically if present). Production deployments pass env vars directly via docker-compose. `config.json` is for non-sensitive deployment config that benefits from version control.

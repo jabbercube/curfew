@@ -70,6 +70,7 @@ The schema is created in the initial migration with all fields the system will e
 | `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
 | `audit_log` | id (PK), actor, action, target, payload (JSON), occurred_at |
 | `manifests` | type (PK), version, sha256, agent_url — versioned agent artifacts |
+| `settings` | Single-row table (id=1 enforced). Operator-tunable runtime knobs (tick rates, retention windows). Initial migration creates the row with defaults; feature migrations add columns. See `## Configuration and settings`. |
 
 ### Data model — concepts
 
@@ -153,8 +154,8 @@ Future tightening (future feature, not the kernel): manifest signing with a long
 
 The kernel ships a plugin SDK in two flavors:
 
-- **Python SDK** (`curfew_plugin_sdk`) — for in-core plugins and any per-device plugin running on Linux/macOS.
-- **PowerShell module** (`curfew-plugin.psm1`) — for windows-pc and any future Windows-resident plugin.
+- **Python SDK** (`curfew_plugin_sdk_python`) — for in-core plugins and any per-device plugin running on Linux/macOS.
+- **PowerShell module** (`curfew-plugin-sdk-powershell`) — for windows-pc and any future Windows-resident plugin.
 
 Both expose:
 
@@ -168,10 +169,105 @@ A plugin's business logic is the **reconciler** — given the lock status, do th
 
 The kernel also ships a **reference test plugin** — a no-op SDK consumer that heartbeats, observes lock-status changes, and writes a sentinel file when locked. The reference plugin lives in the test suite, exercises the SDK end-to-end, and is what the kernel acceptance test runs against. windows-pc is the first non-trivial SDK consumer (a feature on top of the kernel).
 
+### Which SDK each consumer uses
+
+| Plugin           | Where it runs    | SDK                            |
+|------------------|------------------|--------------------------------|
+| `windows-pc`     | Windows PC       | `curfew-plugin-sdk-powershell` |
+| `adguard`        | in-core (docker) | `curfew_plugin_sdk_python`     |
+| `smart-plug`     | in-core (docker) | `curfew_plugin_sdk_python`     |
+| `router-acl`     | in-core (docker) | `curfew_plugin_sdk_python`     |
+| `tailscale-acl`  | in-core (docker) | `curfew_plugin_sdk_python`     |
+| `macos-pc`       | macOS device     | `curfew_plugin_sdk_python`     |
+| `reftest` (test) | test harness     | `curfew_plugin_sdk_python`     |
+
+### Reconciler shape (illustrative)
+
+A plugin author writes only the reconciler. The SDK runs the polling loop, heartbeats, fetches the manifest, verifies the hash, and reports errors back to the core.
+
+Python (in-core or Linux/macOS):
+
+```python
+from curfew_plugin_sdk_python import Plugin
+
+class AdGuard(Plugin):
+    def reconcile(self, status):
+        if status.locked:
+            self.adguard_api.add_rules(self.user_blocklist)
+        else:
+            self.adguard_api.clear_rules()
+
+AdGuard().run()
+```
+
+PowerShell (Windows):
+
+```powershell
+Import-Module curfew-plugin-sdk-powershell
+
+Register-Reconciler -ScriptBlock {
+    param($status)
+    if ($status.locked) {
+        Apply-NTFSDeny -Paths $cfg.exe_paths
+        Stop-MatchingProcesses -Names $cfg.process_names
+    } else {
+        Remove-NTFSDeny -Paths $cfg.exe_paths
+    }
+}
+
+Start-CurfewPlugin
+```
+
+The exact SDK surface (class names, cmdlet names) is implementation detail of ADR-010 — what matters is that a plugin reduces to a reconciler.
+
+## Configuration and settings
+
+The curfew-core API service has two surfaces for tunable values:
+
+- **Config** is boot-time and immutable for the life of the process. Comes from env vars, an optional `.env`, and `config.json`. Used for values needed before the database is open (db path, listen address, root token).
+- **Settings** are runtime-mutable, stored in the database, edited via the API/CLI. No restart required. Used for operational knobs (tick rates, retention windows, thresholds).
+
+Plugin agents have their own bootstrap config (`agent.config` per instance — see "Plugin instance lifecycle"). This section is about the curfew-core API service.
+
+### Config sources (boot-time)
+
+Loaded in order; later wins:
+
+1. Built-in defaults (in code).
+2. `config.json` (path: `CURFEW_CONFIG_PATH`, default `/etc/curfew/config.json` in the docker image, `./config.json` locally).
+3. `.env` file in the working directory (loaded via python-dotenv, populates env before consumption).
+4. Process environment variables (highest precedence).
+
+What lives in config:
+
+| Var | Purpose |
+|---|---|
+| `CURFEW_DB_PATH` | `state.sqlite` location |
+| `CURFEW_ROOT_TOKEN` | operator bearer; env-only, never in `config.json` |
+| `CURFEW_LISTEN_HOST` / `CURFEW_LISTEN_PORT` | bind address for the FastAPI server |
+| `CURFEW_AGENT_BASE_URL` | public URL agents call back to (Traefik-fronted hostname) |
+| `CURFEW_LOG_LEVEL` | `debug` / `info` / `warn` / `error` |
+| `CURFEW_CORS_ORIGINS` | allowed origins for the future GUI |
+
+Convention: secrets live in env (or `.env` for local dev) so `config.json` can be checked in or templated. Implemented with Pydantic v2 `BaseSettings` — schema-validated at boot, so a bad config fails fast rather than producing surprising behaviour.
+
+### Settings (runtime-mutable)
+
+Single-row `settings` table with typed columns. The initial migration creates the row with defaults; feature migrations add columns.
+
+| Setting | Default | What it controls |
+|---|---|---|
+| `plugin_tick_seconds` | 60 | How often plugins poll lock status |
+| `manifest_tick_seconds` | 3600 | How often agents check for updates |
+| `drift_threshold_seconds` | 180 | A plugin counts as drifted after this long without a heartbeat |
+| `audit_retention_days` | 90 | Rolling window before audit rows are pruned |
+
+API: `GET /v1/settings` (read all), `PATCH /v1/settings` (update one or more). CLI: `curfew setting list | get | set`. Writes go through the audit log.
+
 ## Authentication
 
 - **Plugin auth**: per-instance bearer tokens (ADR-006). Hashed at rest. Read scope is full state in the kernel; future tightening to scoped reads is a feature on top.
-- **Operator auth**: V1 uses a single **root bearer token** from env var, distinct from the `admin` user role (which is data-only in V1 — no way for a user with `role: admin` to authenticate yet). Per-user role-based auth (sessions tied to user records) is a feature on top of the kernel; the API surface is shaped to accept it without renames.
+- **Operator auth**: V1 uses a single **root bearer token** (`CURFEW_ROOT_TOKEN` env var; see "Configuration and settings"), distinct from the `admin` user role (which is data-only in V1 — no way for a user with `role: admin` to authenticate yet). Per-user role-based auth (sessions tied to user records) is a feature on top of the kernel; the API surface is shaped to accept it without renames.
 
 ## Audit log
 
@@ -227,6 +323,10 @@ Agent updates
   GET    /v1/agents/{type}/{version}            agent artifact (the agent.ps1 / .py / .sh)
   POST   /v1/agents/{type}/versions             publish a new agent version: body { version, artifact }; rotates the manifest pointer to it
 
+Settings
+  GET    /v1/settings                           read all runtime-mutable settings
+  PATCH  /v1/settings                           update one or more (audited)
+
 Admin
   GET    /v1/admin/snapshot                     full system snapshot (debug; not the primary read path)
   GET    /v1/health                             liveness probe
@@ -241,6 +341,7 @@ curfew app         add | list | show | edit | rm
 curfew plugin      assign | unassign | types | list | drift
 curfew plugin token  mint | revoke | list
 curfew agent       publish <type> <version> <file>
+curfew setting     list | get | set
 curfew lock        <user>
 curfew unlock      <user>
 curfew status                                # human-readable summary
@@ -257,8 +358,8 @@ curfew/
 │   ├── curfew_api/                   # FastAPI service
 │   │   └── migrations/               # Alembic
 │   ├── curfew_cli/                   # CLI — thin HTTP client
-│   ├── curfew_plugin_sdk/            # Python plugin SDK
-│   └── curfew_plugin_powershell/     # PowerShell plugin SDK module (curfew-plugin.psm1)
+│   ├── curfew_plugin_sdk_python/     # Python plugin SDK
+│   └── curfew-plugin-sdk-powershell/ # PowerShell plugin SDK module
 ├── plugins/
 │   └── windows-pc/
 │       ├── agent.ps1                 # the per-tick agent (uses the PowerShell SDK)
@@ -288,6 +389,7 @@ curfew/
 | Layer | Framework | What's covered |
 |-------|-----------|----------------|
 | Schema models | pytest + in-memory SQLite | CRUD round-trips, schema validation, migrations apply forward, FK/uniqueness behaviour. ≥90% coverage. |
+| Config loading | pytest | Precedence (env > .env > config.json > defaults); bad values refuse to boot; secrets never read from `config.json`. |
 | Rule pipeline | pytest | Rule registration, OR composition, reasons aggregation, behaviour with zero rules. |
 | Plugin contract | pytest with a fake plugin | Reference test plugin exercises the full contract; serves as living documentation. |
 | Plugin SDK (Python) | pytest | Polling loop, heartbeat retry, manifest fetch, hash mismatch refusal. |
@@ -353,12 +455,12 @@ Adds a `device_app_overrides(device, app, exe_paths, process_names, urls)` table
 
 Each plugin is a new type with: a capability descriptor, an SDK consumer (Python or PowerShell), and a bootstrap one-liner if per-device. Implementations:
 
-- **`windows-pc`** (per-device, PowerShell SDK) — first plugin; stress-tests the SDK and shapes the contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
-- **`adguard`** (in-core, Python SDK) — first in-core plugin; stress-tests the in-core path. DNS sinkhole via AdGuard Home REST API.
-- **`smart-plug`** (in-core, Python SDK) — Tasmota/Kasa power control.
-- **`router-acl`** (in-core, Python SDK) — UniFi/OPNsense API.
-- **`tailscale-acl`** (in-core, Python SDK) — gate egress for managed devices on the tailnet.
-- **`macos-pc`** (per-device, Python SDK on macOS) — same primitives translated.
+- **`windows-pc`** (per-device, `curfew-plugin-sdk-powershell`) — first plugin; stress-tests the SDK and shapes the contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
+- **`adguard`** (in-core, `curfew_plugin_sdk_python`) — first in-core plugin; stress-tests the in-core path. DNS sinkhole via AdGuard Home REST API.
+- **`smart-plug`** (in-core, `curfew_plugin_sdk_python`) — Tasmota/Kasa power control.
+- **`router-acl`** (in-core, `curfew_plugin_sdk_python`) — UniFi/OPNsense API.
+- **`tailscale-acl`** (in-core, `curfew_plugin_sdk_python`) — gate egress for managed devices on the tailnet.
+- **`macos-pc`** (per-device on macOS, `curfew_plugin_sdk_python`) — same primitives translated.
 
 ## GUI
 
