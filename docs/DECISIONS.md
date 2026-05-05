@@ -157,3 +157,24 @@ Rules implement a single interface, declare their scope at registration, and ret
 - Secrets stay in env; secrets never touch `state.sqlite`. `config.json` can be committed or templated since it never holds the root token.
 
 **Convention:** `.env` is for local-dev convenience (loaded automatically if present). Production deployments pass env vars directly via docker-compose. `config.json` is for non-sensitive deployment config that benefits from version control.
+
+## ADR-012: Heartbeats carry a state hash for change detection
+
+**Decided:** every heartbeat carries the plugin's last-known state hash; the server returns its current hash plus a small set of immediate-effect settings (`tick_seconds`, `drift_threshold_seconds`, etc.). If the hashes match, the agent has nothing new to do. If they differ, the agent fetches full state via `GET /v1/plugins/{instance}/state` and re-runs the reconciler.
+
+**What the hash covers** (computed server-side, deterministic):
+
+- The plugin's scoped lock status — user-scope: governed user's `{locked, reasons}`; device-scope: device's `{locked, reasons}`.
+- Per-instance config (`device_plugins.config` or `core_plugins.config`).
+- The relevant slice of the app catalog (entries referenced by the governed user's `target_apps`).
+- Operational settings the agent reads.
+
+Any operator action that affects the instance — lock toggle, settings change, config edit, app-list edit — eventually changes the hash. The kernel doesn't try to invalidate hashes proactively; the hash is a content digest.
+
+**Rejected:**
+
+- **Always send full state in the heartbeat.** Wasteful on the hot path; heartbeats run every ~60s and state changes maybe a few times a day.
+- **Force agent restart to pick up changes.** No remote-management story; defeats settings being runtime-mutable.
+- **Push (SSE / long-polling) instead of hash polling.** Orthogonal — push is about latency, hashing is about heartbeat payload size. They compose: a future push channel could deliver new hashes proactively.
+
+**What this also solves:** settings propagation. Changing a setting changes the hash; the next heartbeat surfaces the diff. The agent picks up new tick rates and behaviour without a restart.

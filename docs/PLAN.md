@@ -60,7 +60,7 @@ The schema is created in the initial migration with all fields the system will e
 
 | Table | Purpose |
 |-------|---------|
-| `users` | name (PK), role, managed (bool, default true), target_apps (JSON list), schedule (JSON expr, nullable), budget_minutes (int, nullable) |
+| `users` | name (PK), role, managed (bool, default true), target_apps (JSON list) |
 | `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
 | `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
 | `device_plugins` | (device, type, config JSON) — plugin types expected to govern this device, with per-instance config (e.g. the Windows local user account `windows-pc` should ACL) |
@@ -82,8 +82,14 @@ The schema is created in the initial migration with all fields the system will e
 | `role` | `member`, `manager`, or `admin`. Capabilities are cumulative: `member` has no operator powers; `manager` can lock/unlock any user with `managed: true` (including themselves and other managers); `admin` is everything `manager` is plus can edit users, devices, apps, plugin assignments, and agent manifests. Future auth/RBAC keys off this. |
 | `managed` | Bool, defaults to `true`. Whether lock rules apply to this user. Independent of `role` — a teen `manager` could be `managed: true` (has lock control over siblings *and* their own rules apply); a houseguest could be `member, managed: false` (no powers, not subject to rules). When `false`, `GET /v1/users/{user}/status` always returns `{locked: false, reasons: []}` and the rule pipeline is skipped. Operators typically opt out (`--managed false`) for adult managers and admins, and for guests; a teen `manager` who's also subject to rules stays `managed: true`. |
 | `target_apps` | Apps that get blocked when this user is in a locked state (manual lock today; out-of-schedule and budget-exhausted in later phases). References keys in `apps`. |
-| `schedule` | Optional schedule expression (e.g. `"weekday 16:00-20:00"`). Read by the schedule-lock feature when registered. |
-| `budget_minutes` | Optional daily/weekly budget. Read by the budget-lock feature when registered. |
+
+**Per-rule user config — decision deferred:** rules like schedule and budget will eventually need per-user configuration (a schedule expression, a budget value). Where that lives isn't yet decided. Options when the first such rule lands:
+
+- **Columns on `users`** — e.g. `users.schedule`, `users.budget_minutes`. Simple; one query reads everything. Adds a column per new rule (migration); `users` becomes a junk drawer of rule fields over time.
+- **Per-rule tables** — e.g. `user_schedules(user, expr, tz)`, `user_budgets(user, minutes, period)`. Cleanest separation; adding a rule is adding a table, no `users` migration. More joins.
+- **Single JSON field** — e.g. `users.rule_config JSON`. Schemaless from SQL, validated per-rule by Pydantic. Adding a rule is zero schema change. Less queryable.
+
+The kernel commits to none of the above; pick when the first non-kernel rule (likely schedule) actually needs to land. The same decision covers **today-only overrides** for schedules and budgets — extra-minutes-for-today, late-bedtime-tonight — which need a parallel storage shape (date-keyed, auto-expiring at day rollover).
 
 **Devices** are physical things curfew (or a plugin) can act on.
 
@@ -139,6 +145,8 @@ Lifecycle:
 5. Core compares expected instances (derived from the assignment tables) to actual heartbeats; surfaces drift on `GET /v1/plugins`.
 6. Removal: delete the assignment row → `plugin_instances` row deleted in the same transaction → core revokes outstanding tokens → next agent tick gets 401 → operator runs uninstall on the device.
 
+**Drift = unenforced.** A plugin that isn't heartbeating isn't enforcing. The database knows the user is locked; the device doesn't. Drift surfaces on `GET /v1/plugins` for the operator to investigate. Optional fail-closed agent behaviour (auto-lock on disconnect) is a feature on top — see "Auto-lock on disconnect."
+
 ## Agent update integrity
 
 Plugins running on devices fetch their agent code from the core. Updates are versioned and hash-verified:
@@ -159,13 +167,15 @@ The kernel ships a plugin SDK in two flavors:
 
 Both expose:
 
-- Polling loop with configurable tick rate
-- Heartbeat dispatch with retry/backoff
-- Versioned + hash-verified self-update
+- Polling loop with tick rate driven by the heartbeat response
+- Heartbeat dispatch with retry/backoff and **hash-based change detection** (see below)
+- Versioned + hash-verified self-update (per ADR-009)
 - Error reporting back to core (via heartbeat payload)
 - Config bootstrap (instance name, API URL, token)
 
-A plugin's business logic is the **reconciler** — given the lock status, do the right thing. The SDK handles everything else.
+A plugin's business logic is the **reconciler** — given the lock status and per-instance config, do the right thing. The SDK handles everything else.
+
+**Hash-based change detection (ADR-012).** Each heartbeat carries the agent's last-known *state hash*; the server returns its current hash plus a small set of immediate-effect settings (current `tick_seconds`, `drift_threshold_seconds`, etc.). If the hashes match, the agent has nothing new to do — it just records the heartbeat and waits for the next tick. If they differ, it fetches `GET /v1/plugins/{instance}/state` for the full picture (lock status, per-instance config, relevant target apps and app-catalog entries) and re-runs the reconciler. Heartbeats stay tiny; state pulls are rare — typically only when something actually changed.
 
 The kernel also ships a **reference test plugin** — a no-op SDK consumer that heartbeats, observes lock-status changes, and writes a sentinel file when locked. The reference plugin lives in the test suite, exercises the SDK end-to-end, and is what the kernel acceptance test runs against. windows-pc is the first non-trivial SDK consumer (a feature on top of the kernel).
 
@@ -307,7 +317,8 @@ Plugin lifecycle
   POST   /v1/plugins/{instance}/tokens          mint a bearer token; returns { id, secret } — secret shown once
   DELETE /v1/plugins/{instance}/tokens/{id}     revoke
   GET    /v1/plugins/{instance}/tokens          list active token ids (no secrets)
-  POST   /v1/plugins/{instance}/heartbeat       liveness (called by the agent)
+  POST   /v1/plugins/{instance}/heartbeat       body { state_hash, agent_version }; returns { state_hash, tick_seconds, drift_threshold_seconds, ... } — agent compares hashes and pulls /state on mismatch
+  GET    /v1/plugins/{instance}/state           full state for this plugin: scoped lock status, per-instance config, governed users' target_apps, relevant app catalog entries
   POST   /v1/plugins/{instance}/activity        body { user, occurred_at, ... }; no-op until budget rule registered
 
 Locks
@@ -392,7 +403,7 @@ curfew/
 | Config loading | pytest | Precedence (env > .env > config.json > defaults); bad values refuse to boot; secrets never read from `config.json`. |
 | Rule pipeline | pytest | Rule registration, OR composition, reasons aggregation, behaviour with zero rules. |
 | Plugin contract | pytest with a fake plugin | Reference test plugin exercises the full contract; serves as living documentation. |
-| Plugin SDK (Python) | pytest | Polling loop, heartbeat retry, manifest fetch, hash mismatch refusal. |
+| Plugin SDK (Python) | pytest | Polling loop, heartbeat retry, state-hash change detection (matching → no-op; mismatch → pull `/state`), manifest fetch, hash mismatch refusal. |
 | Plugin SDK (PowerShell) | Pester | Same coverage, on the Windows runner. |
 | API | pytest + FastAPI TestClient | Every endpoint: happy path, auth failures, validation errors, idempotency. |
 | Agent update flow | pytest + Pester | Manifest endpoint, hash verification, atomic swap, rollback on failed swap. |
@@ -437,11 +448,17 @@ The first rule registered (user scope). Reads `user_locks.manual_lock`; returns 
 
 ## Schedule lock rule
 
-A new user-scope rule. Reads `users.schedule`; evaluates against current time + timezone; returns `{kind: "out_of_schedule", schedule: "..."}` when out of window. CLI: `curfew schedule <user> "<expr>"`. Tests: expression parsing, time-zone handling, transitions across midnight/DST.
+A new user-scope rule. Reads the user's recurring schedule (storage TBD per the data-model deferred decision); evaluates against current time + timezone; returns `{kind: "out_of_schedule", schedule: "..."}` when out of window. CLI: `curfew schedule <user> "<expr>"`.
+
+**Today-only overrides.** Operator can extend or replace today's schedule for a single user (e.g. "tonight let kid1 stay up until 22:00") without changing the recurring schedule. Likely a small `schedule_overrides(user, date, expr)` table that the rule consults first and falls back to the recurring schedule when no override exists for today; overrides expire when the day passes. CLI: `curfew schedule <user> --today "<expr>"`.
+
+Tests: expression parsing, time-zone handling, transitions across midnight/DST, today-override precedence and expiry.
 
 ## Budget lock rule + activity ingestion
 
-Adds `usage_minutes(user, day, minutes)` table via Alembic migration. Plugins call `POST /v1/plugins/{instance}/activity` with `{user, occurred_at}` when they observe recent user input — the kernel endpoint that was a no-op now writes to `usage_minutes`. A new user-scope rule returns `{kind: "budget_exhausted", consumed: 120, budget: 90}` when `users.budget_minutes` is consumed for the period. Resets daily/weekly. CLI: `curfew budget <user> <minutes>`.
+Adds `usage_minutes(user, day, minutes)` table via Alembic migration. Plugins call `POST /v1/plugins/{instance}/activity` with `{user, occurred_at}` when they observe recent user input — the kernel endpoint that was a no-op now writes to `usage_minutes`. A new user-scope rule returns `{kind: "budget_exhausted", consumed: 120, budget: 90}` when the user's recurring budget is consumed for the period. Resets daily/weekly. CLI: `curfew budget <user> <minutes>`.
+
+**Today-only bonus.** Operator can grant extra minutes for a single day (e.g. "give kid1 30 more minutes today") without changing the recurring budget. Likely a `budget_overrides(user, date, extra_minutes)` table; the rule adds the override to the recurring allowance when computing remaining minutes for that day, and the override expires when the day passes. CLI: `curfew budget <user> --today +30`.
 
 ## Shared-device lock + `--shared` operations
 
@@ -461,6 +478,21 @@ Each plugin is a new type with: a capability descriptor, an SDK consumer (Python
 - **`router-acl`** (in-core, `curfew_plugin_sdk_python`) — UniFi/OPNsense API.
 - **`tailscale-acl`** (in-core, `curfew_plugin_sdk_python`) — gate egress for managed devices on the tailnet.
 - **`macos-pc`** (per-device on macOS, `curfew_plugin_sdk_python`) — same primitives translated.
+
+## Auto-lock on disconnect (fail-closed agents)
+
+Adds a `failclosed_after_seconds` setting (default `0` = disabled). When non-zero, any agent that hasn't successfully fetched state for that many seconds invokes its reconciler with `{locked: true, reasons: [{kind: "failclosed", since: ...}]}` regardless of last-known state. Closes the gap between "locked in the database" and "enforced on the device" while the agent is offline.
+
+Implementation lives in the SDK — both Python and PowerShell flavours track time-since-last-successful-fetch and trip the fail-closed reconciler when they cross the threshold. Per-instance opt-out or per-instance threshold override (via `device_plugins.config`) is a future tightening; the kernel ships a single global setting.
+
+## Drift notifications
+
+Operator alerting when a plugin instance is drifted past `drift_threshold_seconds`. Two implementation options, neither committed:
+
+- **Outbound webhook** — `drift_webhook_url` setting; the core POSTs a small payload when an instance drifts. Operator pipes into Slack / email / whatever.
+- **Polled query** — `GET /v1/plugins?drifted=true` is enough for an external cron to ping the operator.
+
+Until either lands, the operator monitors `GET /v1/plugins` manually. Auto-lock on disconnect (above) is the primary mitigation; notifications are the secondary signal so the operator knows enforcement has switched to fail-closed mode.
 
 ## GUI
 
