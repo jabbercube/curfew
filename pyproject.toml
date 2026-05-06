@@ -7,10 +7,10 @@ name = "curfew"
 version = "0.0.0"
 description = "Modular, extensible tool for managing screentime across the household"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 dependencies = []
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "ruff>=0.6",
     "mypy>=1.11",
@@ -28,7 +28,7 @@ packages = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py313"
 src = ["src", "tests"]
 exclude = ["src/curfew-agent-sdk-powershell"]
 
@@ -36,7 +36,7 @@ exclude = ["src/curfew-agent-sdk-powershell"]
 select = ["E", "F", "W", "I", "B", "UP", "N", "RUF"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.13"
 strict = true
 mypy_path = "src"
 explicit_package_bases = true
