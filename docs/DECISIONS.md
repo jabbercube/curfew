@@ -101,7 +101,7 @@ A plugin is a Python class subclassing `Plugin` from the plugin SDK. Curfew-core
 
 **Decided:** desired state is declared in the database; runtime data either projects from it or is irrelevant.
 
-- **Agents:** `device_agents(device, type, config)` declares what's expected to be running on each device. `agent_instances(device, last_heartbeat, last_seen_version)` is a derived projection — created and deleted in the same transaction as the `device_agents` row. The instance row holds runtime fields; the assignment row holds desired state. The core records `last_heartbeat` on each tick and exposes it on `GET /v1/agents`. The kernel deliberately does *not* paint stale heartbeats as an alert — a powered-off device looks identical to a broken agent without independent reachability evidence (see the Reachability monitoring feature in PLAN.md).
+- **Agents:** `agents(device, type, config, last_heartbeat, last_seen_version)` — one row per device that has an agent installed. Declarative columns (`type`, `config`) are set at install; runtime columns (`last_heartbeat`, `last_seen_version`) start NULL and are updated by the agent's heartbeat. The kernel deliberately does *not* paint stale heartbeats as an alert — a powered-off device looks identical to a broken agent without independent reachability evidence (see the Reachability monitoring feature in PLAN.md). The desired/runtime split lives within one row rather than across two tables: the runtime side carries only two columns and never drifts independently from desired (no reconciliation controller; the agent reports back), so a separate projection table earned no keep.
 - **Plugins:** `plugins(type, instance_id, config, governs, paused)` declares which plugins are assigned and how. There's no separate runtime-state table because plugins are in-process — their liveness *is* the core's. An assigned-but-paused plugin has its row but is skipped during reconciliation.
 
 **Rejected:**
@@ -212,7 +212,7 @@ This applies to **agents only** (the polling extension surface). Plugins are in-
 
 - The device's owner's lock status (`{locked, reasons}` for the user).
 - For shared devices: the device's lock status from the device-scope rule pipeline.
-- Per-device agent config (`device_agents.config`).
+- Per-device agent config (`agents.config`).
 - The relevant slice of the app catalog (entries referenced by the governed user's `target_apps`).
 - Operational settings the agent reads.
 

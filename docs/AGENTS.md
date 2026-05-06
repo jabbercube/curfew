@@ -42,8 +42,7 @@ curfew agent install windows-agent gamingrig --config '{"windows_user": "Kid1Loc
 ```
 
 This:
-- Inserts a row into `device_agents(device=gamingrig, type=windows-agent, config=...)`.
-- Creates the matching `agent_instances(device=gamingrig)` runtime row in the same transaction (initially with no heartbeats yet).
+- Inserts a row into `agents(device=gamingrig, type=windows-agent, config=...)` with `last_heartbeat` and `last_seen_version` NULL (no heartbeats yet).
 - Mints a device-scoped bearer token, hashes it, inserts into `agent_tokens`.
 - Prints `{token: { id, secret }, bootstrap: "..."}`. The secret is shown once.
 
@@ -83,7 +82,7 @@ curfew agent uninstall gamingrig
 ```
 
 This:
-- Deletes the `device_agents` row → `agent_instances` cascade-deletes in the same transaction.
+- Deletes the `agents` row.
 - Sets `revoked_at` on outstanding tokens.
 - Next heartbeat from `gamingrig` returns 401. The agent SDK treats that as "I've been disowned" and stops trying.
 - Operator removes the local install (uninstall script, or just delete the scheduled task).

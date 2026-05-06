@@ -63,8 +63,7 @@ The schema is created in the initial migration with all fields the system will e
 | `users` | name (PK), role, managed (bool, default true), target_apps (JSON list) |
 | `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
 | `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
-| `device_agents` | (device PK, type, config JSON) — the agent type installed on this device (one per device), with config (e.g. which Windows local user account to ACL) |
-| `agent_instances` | device (PK, FK→devices), last_heartbeat (nullable), last_seen_version. Runtime state; one row per `device_agents` row, created and deleted in the same transaction. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped). The kernel records this fact; it doesn't interpret stale heartbeats as an alert (a powered-off device looks the same as a broken agent without independent reachability data — see the Reachability monitoring feature) |
+| `agents` | (device PK, FK→devices, type, config JSON, last_heartbeat nullable, last_seen_version nullable) — one row per device that has an agent installed. `type` and `config` are declarative (set at install, e.g. which Windows local user account to ACL); `last_heartbeat` and `last_seen_version` are runtime fields the agent updates on each tick. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped). The kernel records this fact; it doesn't interpret stale heartbeats as an alert (a powered-off device looks the same as a broken agent without independent reachability data — see the Reachability monitoring feature) |
 | `agent_tokens` | token_hash (PK), device, created_at, revoked_at — bearer per device, used by the agent on that device to authenticate |
 | `plugins` | (type, instance_id) PK; config JSON; governs JSON list (user names, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`. `instance_id` is the literal string `"default"` unless the operator needs multiple instances of the same type, in which case they pick a name. URL paths use both segments (`/v1/plugins/{type}/{instance_id}`); the CLI defaults the instance_id to `default` so single-instance plugins read naturally (`curfew plugin pause adguard`) |
 | `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
@@ -141,14 +140,13 @@ Same goal — *given a user's lock state, make my surface reflect it* — but th
 One agent per device. The agent code is `windows-agent`, `macos-agent`, etc. — an installable program that runs on the device and polls curfew-core.
 
 1. Operator installs the agent on a device (`curfew agent install windows-agent gamingrig --config '{"windows_user": "Kid1Local"}'`). This:
-   - Inserts a row in `device_agents`.
-   - Creates the matching `agent_instances` row in the same transaction.
+   - Inserts a row in `agents` (declarative columns set: `device`, `type`, `config`; runtime columns `last_heartbeat` and `last_seen_version` start NULL).
    - Mints a device-scoped bearer token (one row in `agent_tokens`); returns the secret once.
    - Prints a bootstrap one-liner for the operator to run on the device.
 2. Operator runs the bootstrap on the device. It fetches the agent code via the versioned manifest (`GET /v1/agents/{type}/manifest`), verifies SHA-256, installs, registers a scheduled task / launchd / cron job.
 3. Agent heartbeats every tick (`POST /v1/devices/{device}/heartbeat`) carrying its last-known state hash. If the server's hash differs, the agent fetches `GET /v1/devices/{device}/state` and re-runs its reconciler. (See ADR-012.)
 4. Core records `last_heartbeat` on each tick. `GET /v1/agents` returns `last_heartbeat` (and `last_heartbeat IS NULL` if the agent has never reported in yet — assigned but not bootstrapped). The kernel doesn't interpret this as an alert: a powered-off device looks the same as a broken agent without an independent presence signal. Real "device is on but agent isn't checking in" alerting is the Reachability monitoring feature.
-5. Removal: `curfew agent uninstall gamingrig` → deletes the `device_agents` row → `agent_instances` cascade-deletes → outstanding tokens revoked → next agent tick gets 401 → operator removes the local install.
+5. Removal: `curfew agent uninstall gamingrig` → deletes the `agents` row → outstanding tokens revoked → next agent tick gets 401 → operator removes the local install.
 
 **A non-heartbeating agent isn't enforcing.** The database knows the user is locked; if the agent isn't running, the device doesn't. The kernel records `last_heartbeat` but doesn't interpret stale values as an alert — a powered-off device looks the same as a broken one. Two features close this gap: **auto-lock on disconnect** (agent-side fail-closed; the agent locks itself when it can't reach the core) is the primary mitigation, and **reachability monitoring** (operator-side detection of "device on but agent silent") is the alert signal. Both are described under Features.
 
@@ -364,7 +362,7 @@ Agents (per-device extension surface)
   GET    /v1/agents                             list installed agents with last_heartbeat (consumer interprets staleness)
   GET    /v1/devices/{device}/agent             fetch the agent installed on this device (type, config, last_heartbeat, last_seen_version)
   POST   /v1/devices/{device}/agent             body { type, config }; installs an agent on this device, mints a bearer, returns { token: { id, secret }, bootstrap }
-  DELETE /v1/devices/{device}/agent             uninstall the agent (deletes device_agents + agent_instances rows, revokes tokens)
+  DELETE /v1/devices/{device}/agent             uninstall the agent (deletes the agents row, revokes tokens)
   POST   /v1/devices/{device}/heartbeat         body { state_hash, agent_version, errors?: [{kind, message, occurred_at}] }; returns { state_hash, agent_tick_seconds, ... }
   GET    /v1/devices/{device}/state             full state for this device's agent: scoped lock status, agent config, target apps, relevant app catalog entries
   POST   /v1/devices/{device}/activity          body { user, occurred_at, ... }; no-op until budget rule registered
@@ -506,7 +504,7 @@ The kernel is "done" when both extension surfaces work end-to-end. Two reference
 
 1. CLI creates a user (`curfew user add kid1 --role member`) and a device (`curfew device add gamingrig --owner kid1 --type pc --os windows`).
 2. CLI publishes the reference agent's first version (`curfew agent publish reftest_agent 1.0.0 ./reftest_agent.tar`).
-3. CLI installs the reference agent (`curfew agent install reftest_agent gamingrig --config '{}'`); verify the `device_agents` and `agent_instances` rows are created in the same transaction; CLI prints the secret once and the bootstrap one-liner.
+3. CLI installs the reference agent (`curfew agent install reftest_agent gamingrig --config '{}'`); verify the `agents` row is created with declarative columns set and runtime columns NULL; CLI prints the secret once and the bootstrap one-liner.
 4. The reference agent runs the bootstrap. It fetches the manifest, verifies SHA-256, installs.
 5. Agent heartbeats; `GET /v1/agents` shows `last_heartbeat` advancing on each tick.
 6. Stop the agent; `GET /v1/agents` shows the agent's `last_heartbeat` no longer advancing (interpretation is the consumer's job — the kernel just records).
@@ -586,7 +584,7 @@ See [PLUGINS.md](PLUGINS.md) for how to author a new plugin.
 
 Adds a `failclosed_after_seconds` setting (default `0` = disabled). When non-zero, any agent that hasn't successfully fetched state for that many seconds invokes its reconciler with `{locked: true, reasons: [{kind: "failclosed", since: ...}]}` regardless of last-known state. Closes the gap between "locked in the database" and "enforced on the device" while the agent is offline.
 
-Implementation lives in the agent SDK — both Python and PowerShell flavours track time-since-last-successful-fetch and trip the fail-closed reconciler when they cross the threshold. Per-device opt-out or per-device threshold override (via `device_agents.config`) is a future tightening; the kernel ships a single global setting.
+Implementation lives in the agent SDK — both Python and PowerShell flavours track time-since-last-successful-fetch and trip the fail-closed reconciler when they cross the threshold. Per-device opt-out or per-device threshold override (via `agents.config`) is a future tightening; the kernel ships a single global setting.
 
 (Plugins don't need this — they're in-process; "disconnect" is meaningless for them.)
 
