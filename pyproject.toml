@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "curfew"
+version = "0.0.0"
+description = "Modular, extensible tool for managing screentime across the household"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pytest>=8",
+    "pre-commit>=3.7",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/curfew",
+    "src/curfew_api",
+    "src/curfew_cli",
+    "src/curfew_agent_sdk_python",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+exclude = ["src/curfew-agent-sdk-powershell"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+mypy_path = "src"
+explicit_package_bases = true
+packages = ["curfew", "curfew_api"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
