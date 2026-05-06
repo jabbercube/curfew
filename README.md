@@ -2,6 +2,8 @@
 
 A modular, extensible tool for managing screentime across the household. 
 
+![curfew splash](design/splash.png)
+
 ## Tech Stack
 
 A small dockerized core service exposes an HTTP API. Two extension surfaces enforce policy at different layers — **agents** that run on a managed device (Windows PCs, Macs) and **plugins** that run in-core (DNS sinkhole, smart plugs, router ACLs, and more).
