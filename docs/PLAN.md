@@ -64,15 +64,15 @@ The schema is created in the initial migration with all fields the system will e
 
 | Table | Purpose |
 |-------|---------|
-| `users` | name (PK), role, managed (bool, default true), target_apps (JSON list) |
-| `devices` | name (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
-| `apps` | name (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
+| `users` | slug (PK), role, managed (bool, default true). Per-user app/schedule/budget config is deferred — see "Per-rule user config — decision deferred" below. |
+| `devices` | slug (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
+| `apps` | slug (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
 | `agents` | (device PK, FK→devices, type, config JSON, last_heartbeat nullable, last_seen_version nullable) — one row per device that has an agent installed. `type` and `config` are declarative (set at install, e.g. which Windows local user account to ACL); `last_heartbeat` and `last_seen_version` are runtime fields the agent updates on each tick. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped). The kernel records this fact; it doesn't interpret stale heartbeats as an alert (a powered-off device looks the same as a broken agent without independent reachability data — see the Reachability monitoring feature) |
-| `agent_tokens` | token_hash (PK), device, created_at, revoked_at — bearer per device, used by the agent on that device to authenticate |
-| `plugins` | (type, instance_id) PK; config JSON; governs JSON list (user names, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`. `instance_id` is the literal string `"default"` unless the operator needs multiple instances of the same type, in which case they pick a name. URL paths use both segments (`/v1/plugins/{type}/{instance_id}`); the CLI defaults the instance_id to `default` so single-instance plugins read naturally (`curfew plugin pause adguard`) |
-| `user_locks` | user (PK, FK→users), manual_lock (bool), set_at, set_by |
-| `audit_log` | id (PK), actor, action, target, payload (JSON), occurred_at |
-| `manifests` | type (PK), version, sha256, agent_url — versioned **agent** artifacts (plugins are not distributed this way; they're files on disk) |
+| `agent_tokens` | id (UUID PK), token_hash (UNIQUE indexed), device (FK→devices), created_at, revoked_at — bearer per device, used by the agent on that device to authenticate. The auth path queries by `token_hash`; the CLI's management identifier is `id` so the API never leaks the hash through URLs or list responses. |
+| `plugins` | (type, instance_id) PK; config JSON; users JSON list (user slugs, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`. `instance_id` is the literal string `"default"` unless the operator needs multiple instances of the same type, in which case they pick a name. URL paths use both segments (`/v1/plugins/{type}/{instance_id}`); the CLI defaults the instance_id to `default` so single-instance plugins read naturally (`curfew plugin pause adguard`) |
+| `user_locks` | user (PK, FK→users.slug), manual_lock (bool), set_at, set_by |
+| `audit_log` | id (PK), actor, action, target_kind (enum: user/device/app/agent/plugin/settings/manifest), target_id, payload (JSON), occurred_at. Indexed on `occurred_at` (for retention pruning) and `(target_kind, target_id)` (for "all events for kid1" queries). |
+| `manifests` | type (PK), version, sha256, url — versioned **agent** artifacts (plugins are not distributed this way; they're files on disk) |
 | `settings` | Single-row table (id=1 enforced). Operator-tunable runtime knobs (tick rates, retention windows). Initial migration creates the row with defaults; feature migrations add columns. See `## Configuration and settings`. |
 
 ### Data model — concepts
@@ -81,12 +81,11 @@ The schema is created in the initial migration with all fields the system will e
 
 | Field | Why it matters |
 |-------|----------------|
-| `name` | Stable identifier used in CLI/API/UI. Short string (`kid1`), not a real name. |
+| `slug` | Stable identifier used in CLI/API/UI. Short URL-safe string (`kid1`), not a display name. |
 | `role` | `member`, `manager`, or `admin`. Capabilities are cumulative: `member` has no operator powers; `manager` can lock/unlock any user with `managed: true` (including themselves and other managers); `admin` is everything `manager` is plus can edit users, devices, apps, plugin assignments, and agent manifests. Future auth/RBAC keys off this. |
 | `managed` | Bool, defaults to `true`. Whether lock rules apply to this user. Independent of `role` — a teen `manager` could be `managed: true` (has lock control over siblings *and* their own rules apply); a houseguest could be `member, managed: false` (no powers, not subject to rules). When `false`, `GET /v1/users/{user}/status` always returns `{locked: false, reasons: []}` and the rule pipeline is skipped. Operators typically opt out (`--managed false`) for adult managers and admins, and for guests; a teen `manager` who's also subject to rules stays `managed: true`. |
-| `target_apps` | Apps that get blocked when this user is in a locked state (manual lock today; out-of-schedule and budget-exhausted in later phases). References keys in `apps`. |
 
-**Per-rule user config — decision deferred:** rules like schedule and budget will eventually need per-user configuration (a schedule expression, a budget value). Where that lives isn't yet decided. Options when the first such rule lands:
+**Per-rule user config — decision deferred:** rules like schedule and budget will eventually need per-user configuration (a schedule expression, a budget value). The `target_apps` list (which apps an agent should block for this user when locked) falls into this same bucket — it isn't in the kernel schema yet; it lands when the first concrete agent (`windows-agent`) needs to consume it. Where any of this lives isn't yet decided. Options when the first such rule lands:
 
 - **Columns on `users`** — e.g. `users.schedule`, `users.budget_minutes`. Simple; one query reads everything. Adds a column per new rule (migration); `users` becomes a junk drawer of rule fields over time.
 - **Per-rule tables** — e.g. `user_schedules(user, expr, tz)`, `user_budgets(user, minutes, period)`. Cleanest separation; adding a rule is adding a table, no `users` migration. More joins.
@@ -98,9 +97,9 @@ The kernel commits to none of the above; pick when the first non-kernel rule (li
 
 | Field | Why it matters |
 |-------|----------------|
-| `name` | Used in CLI/UI and in API paths (`/v1/devices/gamingrig/...`). The agent installed on a device is identified by the device name; there's no compound `<type>:<device>` identifier. |
+| `slug` | Used in CLI/UI and in API paths (`/v1/devices/gamingrig/...`). The agent installed on a device is identified by the device slug; there's no compound `<type>:<device>` identifier. |
 | `owner` | The user this device belongs to. For managed devices, also the user whose schedule/budget activity here debits. Null = shared device (governed as a group via the shared-device-lock feature when registered). |
-| `type` | `pc | laptop | phone | tablet | console | tv`. Constrains which plugin types apply. |
+| `type` | `pc | phone | tablet | console | tv`. Laptops are `pc` — same OS-level enforcement (NTFS ACL, registry policy, process kill) applies regardless of form factor. Constrains which plugin types apply. |
 | `os` | `windows | macos | linux | ios | android`. Selects per-device plugin variants. |
 | `mac` | Network-layer identity, stable across IP changes. List, since a device commonly has multiple MACs (Wi-Fi + ethernet; randomized per network). Read by network-side plugins (e.g. `router-acl`) and by the Reachability monitoring feature for ARP probes. |
 | `managed` | Whether curfew governs this device at all. Lets devices be tracked for completeness without being put under policy (e.g. a manager's laptop tracked but not enforced). |
@@ -174,7 +173,7 @@ plugins/
 ```
 
 1. **Discovery** (at curfew-core startup): scan each directory in `CURFEW_PLUGINS_DIRS` in order. For each subdirectory: read `manifest.toml`, optionally `pip install -r requirements.txt` into curfew-core's shared Python environment, import `plugin.py`, find the entry-point class, register it under the manifest's `type` name. **Entry-point selection:** if `plugin.py` declares exactly one class subclassing `Plugin`, use it. If it declares multiple subclasses (e.g. an internal `BaseAdGuardClient(Plugin)` plus a concrete `AdGuardPlugin(BaseAdGuardClient)`), the **leaf class** in the hierarchy wins. Zero subclasses is a discovery error; the plugin is skipped, the error logged and surfaced on `GET /v1/plugins/types`.
-2. **Assignment** (operator): `curfew plugin assign adguard --config '{"url": "..."}' --governs '["*"]'`. Validates config against the plugin's Pydantic schema, inserts a row in `plugins`, instantiates the plugin in memory. **Convention: secrets stay in env, not in config.** A plugin needing a secret declares an `*_env` field (e.g. `api_token_env: "ADGUARD_TOKEN"`) and reads `os.environ[name]` at runtime; the config row holds only the env-var name. This keeps `state.sqlite` and `GET /v1/plugins` free of plaintext secrets.
+2. **Assignment** (operator): `curfew plugin assign adguard --config '{"url": "..."}' --users '["*"]'`. Validates config against the plugin's Pydantic schema, inserts a row in `plugins`, instantiates the plugin in memory. **Convention: secrets stay in env, not in config.** A plugin needing a secret declares an `*_env` field (e.g. `api_token_env: "ADGUARD_TOKEN"`) and reads `os.environ[name]` at runtime; the config row holds only the env-var name. This keeps `state.sqlite` and `GET /v1/plugins` free of plaintext secrets.
 3. **Reconciliation** (event-driven, async to the originating request): when state changes for a user the plugin governs (lock toggled, schedule fired, etc.), curfew-core schedules `reconcile()` calls on every governing plugin as background tasks. The originating API request returns immediately after the database write; the reconciles fire in the background. A reconcile failure is logged and recorded in the audit log but doesn't fail the originating request — slow plugins don't delay the operator. Operators check the audit log if they need to confirm reconcile succeeded.
 4. **Safety-net resync** (slow tick, default every 5 minutes): curfew-core walks all governed users and calls `reconcile()` on each registered plugin instance for each governed user. Catches missed events from restarts.
 5. **Pause / unpause**: `curfew plugin pause adguard` flips a `paused` flag. The core stops calling reconcile until unpaused; the instance stays loaded and config is preserved.
@@ -375,10 +374,10 @@ Agents (per-device extension surface)
   DELETE /v1/devices/{device}/tokens/{id}       revoke
 
 Plugins (in-core extension surface)
-  GET    /v1/plugins                            list assigned plugin instances + paused/governs/config
+  GET    /v1/plugins                            list assigned plugin instances + paused/users/config
   GET    /v1/plugins/types                      list discovered plugin types from CURFEW_PLUGINS_DIRS + their config_schema
-  POST   /v1/plugins                            body { type, instance_id?, config, governs }; assigns a plugin (instance_id defaults to "default")
-  PATCH  /v1/plugins/{type}/{instance_id}       update config / governs / paused for this instance
+  POST   /v1/plugins                            body { type, instance_id?, config, users }; assigns a plugin (instance_id defaults to "default")
+  PATCH  /v1/plugins/{type}/{instance_id}       update config / users / paused for this instance
   DELETE /v1/plugins/{type}/{instance_id}       unassign this instance
 
 Locks
@@ -531,7 +530,7 @@ The kernel is "done" when both extension surfaces work end-to-end. Two reference
 **Plugin path:**
 
 11. Drop `reftest_plugin/` into a directory in `CURFEW_PLUGINS_DIRS`; restart curfew-core. `GET /v1/plugins/types` lists `reftest_plugin` as discovered.
-12. CLI assigns the plugin (`curfew plugin assign reftest_plugin --config '{}' --governs '["kid1"]'`).
+12. CLI assigns the plugin (`curfew plugin assign reftest_plugin --config '{}' --users '["kid1"]'`).
 13. CLI locks `kid1` again; the core directly calls `reftest_plugin.reconcile()` (in-process); the plugin writes its sentinel.
 14. CLI unlocks; reconcile is called again; the plugin clears its sentinel.
 15. CLI pauses the plugin (`curfew plugin pause reftest_plugin`); subsequent state changes do not trigger reconcile.

@@ -1,183 +1,239 @@
-# Step 1.5 — Per-component flat layout + ADR-014
+# Step 2 — Storage kernel: SQLModel models + initial migration
 
 ## Context
 
-The just-scaffolded `src/`-layout (PR #1, PR #2) puts every Python package under one root `pyproject.toml` and a top-level `tests/` tree. PLAN.md adopted that without explicit justification — it's the soft Python default. After a tool-choice audit (PR #2 switched the project to uv) and a reread of how the components actually ship — agent SDKs published for third-party agent authors, `windows-agent` distributed as a tarball, CLI shipped to operator laptops, `curfew-core` shipped as a Docker image, in-core plugins drop-in'd into a discovery directory — the components are independent deliverables, not one big package. An Immich-style **per-component flat layout** matches the deliverables, plays well with uv workspaces (just adopted), gives the awkward PowerShell SDK and reference-test consumers natural homes, and per-image Dockerfiles co-locate with their service.
+The repo has scaffolding (PR #1, #2, #3) and design assets (PR #4) but **zero schema, zero models, zero migrations**. Every subsequent kernel slice (auth middleware, rule pipeline, every CRUD endpoint, agent state hash, plugin discovery, audit middleware) reads or writes the database. PLAN.md commits to "the schema is created in the initial migration with all fields the system will ever need — even fields no rule reads yet" — so this PR lands all 10 kernel tables in **one Alembic migration**, plus the SQLModel classes for them, plus the seed `settings` row with defaults. Not a feature-by-feature roll-out.
 
-This step migrates while there is **zero functional code**: pure directory shuffle, per-package `pyproject.toml`s, `[tool.uv.workspace]` at root, doc updates, and a new ADR. Cost now ≈ 45 min. Cost in 6 months once code lands ≈ multi-day refactor.
+This is the highest-judgment piece of the kernel: once the schema is in, every later slice's API surface is constrained by it. Migrations against a populated database are far more expensive than getting the column shape right now. PLAN.md is explicit about this being the intent.
 
-User has explicitly endorsed the proposed shape ("this is perfect") and asked for the matching ADR ("also add a decision"). PR #2 is already merged on `main`, so this is a fresh branch off `main`.
+## Scope
 
-## Target layout
+**In:**
+- 10 SQLModel classes in `core/curfew/models.py` covering every kernel table.
+- One Alembic migration (`api/migrations/versions/0001_initial.py`) creating all tables + seeding the `settings` row.
+- Alembic env wiring (`api/alembic.ini`, `api/migrations/env.py`, `api/migrations/script.py.mako`).
+- Per-model unit tests in `core/tests/test_models.py` (CRUD round-trip, FK enforcement, JSON columns, enum values, `settings` singleton CHECK).
+- One `api/tests/test_migration.py` exercising "apply migration on empty DB → tables exist + settings row seeded".
+- Dep additions: `core/pyproject.toml` gains `sqlmodel`; `api/pyproject.toml` gains `alembic`.
+- **PLAN.md doc updates** to match the schema deviations (rename `name`→`slug`, drop `LAPTOP`, rename `governs`→`users`, drop `target_apps`, rename `agent_url`→`url`, document `target_kind`/`target_id`, document `agent_tokens.id`).
+
+**Out (next PR):**
+- DB engine factory / session lifecycle (the runtime side).
+- The FastAPI app skeleton, auth middleware, audit middleware.
+- Any CRUD endpoint or rule.
+- Async session support — V1 is **sync SQLAlchemy** (rationale: SQLite-WAL at homelab scale is fast enough; sync simplifies the stack; Alembic itself stays sync regardless. Async can be a future feature if request volume ever justifies it; the model layer doesn't need to change.)
+
+## Schema deviations from PLAN.md
+
+Three I proposed myself + four corrections from the user (2026-05-05 review). All applied. PLAN.md is updated to match where it conflicts (see "PLAN.md updates" below).
+
+### 1. `manifests.agent_url` → `manifests.url`
+
+PLAN.md line 75 names the column `agent_url`, but lines 388–389 show the API returning `{ version, sha256, url }`. Rename the column to `url` to match the API verbatim. The "agent_" prefix is redundant — the `manifests` table only holds agent manifests (PLAN.md is explicit about plugins not being distributed this way).
+
+### 2. `agent_tokens` — add surrogate `id`, keep `token_hash` as unique non-PK index
+
+PLAN.md uses `token_hash` as the PK. The CLI surface (PLAN.md line 369: `DELETE /v1/devices/{device}/tokens/{id}`) calls the management identifier `id`, and `curfew agent token list` returns "active token IDs (no secrets)". If `id == token_hash`, the management API leaks hashes through URL paths and list responses. Not a credential break — the bearer secret never touches the DB — but it's poor hygiene and confuses future log redaction.
+
+Shape: `id` (UUID, PK) + `token_hash` (string, UNIQUE indexed) + `device` (FK) + `created_at` + `revoked_at`. The CLI's `id` is the UUID; the auth path still does `WHERE token_hash = ?` with the same single-index latency.
+
+### 3. `audit_log.target` → `target_kind` + `target_id`
+
+PLAN.md uses a single `target` column. Every realistic query is "all audit rows for *user* kid1" or "all audit rows for *device* gamingrig" — two-axis filtering. Splitting into `target_kind` (enum) + `target_id` (string) makes both axes indexable and structured.
+
+Cost: one column more on a non-hot-path table. Worth it.
+
+### 4. PK column rename: `name` → `slug` on `users`, `devices`, `apps`
+
+The PK is a URL-safe identifier (`kid1`, `gamingrig`), not a display name. PLAN.md itself describes it as "Stable identifier used in CLI/API/UI. Short string (`kid1`), not a real name." `slug` is the accurate name; `name` invites confusion with future display-name columns (e.g. "Kid One — Family Account"). FKs follow: `devices.owner` references `users.slug`; `agents.device` and `user_locks.user` reference the slugs of their parents.
+
+Renaming on a not-yet-existing schema is free; renaming after the API ships is an `ALTER TABLE` plus client churn.
+
+### 5. Drop `DeviceType.LAPTOP` — laptop folds into `PC`
+
+A laptop and a desktop PC are enforced identically (NTFS ACL, registry policy, process kill). The form-factor distinction has no behaviour in the kernel. `DeviceType` becomes `{ pc, phone, tablet, console, tv }`. If a future feature needs to distinguish them (battery thresholds? lid-close behaviour?) it can add the column then.
+
+### 6. Defer `users.target_apps` (and the `users → apps` link)
+
+User asked to "remove target_apps from user to begin with". The kernel ships **without** a per-user app list. Implications:
+
+- The `apps` catalog table still exists (it's a global catalog of blockable executables and URLs).
+- `User` has no link to apps in this PR. Manual lock fires, status returns `locked: true`, but agents have no per-user app list to consult yet.
+- Adding it back later is a one-line migration: `ALTER TABLE users ADD COLUMN target_apps JSON DEFAULT '[]'`. The decision about *where* it lives (column on users vs. junction table vs. JSON rule_config — see PLAN.md "Per-rule user config — decision deferred" lines 89–95) is intentionally deferred to when the first concrete agent (`windows-agent`) lands and we know the access pattern.
+- The reftest agent (which will land in a later PR) can hard-code an empty target list or read from device-level config.
+
+### 7. `plugins.governs` → `plugins.users`
+
+Cleaner. The column holds user slugs (or `["*"]`); calling it `users` says exactly that. CLI flag becomes `--users` instead of `--governs`. Plugin reconcile sees `scope.users` instead of `scope.governs` (or whatever the SDK names it).
+
+## Other open decisions (recommendations, not pushback)
+
+- **Single `models.py` vs split per-table files:** single file. ~250 lines total for 10 tables; splitting just adds import ceremony and `__init__.py` re-exports.
+- **Enum storage:** Python `enum.Enum` (string values) + SQLAlchemy `Column(String)` with a CHECK constraint listing valid values. Avoids SQLite's lack of native ENUM, stays portable to PostgreSQL if we ever migrate, and gives Pydantic a clean enum type.
+- **JSON columns:** SQLModel `Field(sa_column=Column(JSON))` with Python type `list[str]` or `dict[str, Any]`. SQLAlchemy + SQLite stores as TEXT; Pydantic round-trips cleanly.
+- **Timestamps:** `DateTime(timezone=True)` everywhere. Defaults via `default_factory=lambda: datetime.now(timezone.utc)`. No naive datetimes.
+- **`user_locks` row creation:** lazy. Absent row = `manual_lock = false`. Saves an INSERT on user creation; matches the rule's "treat missing as unlocked" semantics. The lock endpoint upserts.
+- **`settings` singleton:** SQLite CHECK `id = 1`, plus app-layer assertion (defense in depth). Initial migration `INSERT INTO settings (id, agent_tick_seconds, ...) VALUES (1, 60, ...)`.
+- **SQLAlchemy naming convention** in `MetaData`: standard naming for indexes/FKs/UQ/CK so Alembic auto-gen produces stable constraint names across machines. Pattern: `ix_%(column_0_label)s`, `uq_%(table_name)s_%(column_0_name)s`, `fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s`, `pk_%(table_name)s`, `ck_%(table_name)s_%(constraint_name)s`.
+
+## The 10 tables (final shape)
+
+All paths are `core/curfew/models.py`. Ordering reflects FK dependencies for migration ops.
+
+```python
+# Enums
+class UserRole(str, Enum): MEMBER, MANAGER, ADMIN
+class DeviceType(str, Enum): PC, PHONE, TABLET, CONSOLE, TV    # LAPTOP folded into PC
+class DeviceOS(str, Enum): WINDOWS, MACOS, LINUX, IOS, ANDROID
+class AuditTargetKind(str, Enum): USER, DEVICE, APP, AGENT, PLUGIN, SETTINGS, MANIFEST
+
+# Tables (in dependency order)
+
+class User:
+    slug: str = PK
+    role: UserRole
+    managed: bool = True
+    # target_apps deferred; add later via ALTER TABLE when the first concrete agent lands
+
+class App:
+    slug: str = PK
+    exe_paths: list[str] = []        # JSON
+    process_names: list[str] = []    # JSON
+    urls: list[str] = []             # JSON
+
+class Device:
+    slug: str = PK
+    owner: str | None = FK(User.slug)    # nullable for shared devices
+    type: DeviceType
+    os: DeviceOS
+    mac: list[str] = []              # JSON
+    managed: bool = True
+
+class Agent:
+    device: str = PK + FK(Device.slug)   # one agent per device
+    type: str                            # e.g. "windows-agent"
+    config: dict[str, Any] = {}          # JSON; per-agent-type schema
+    last_heartbeat: datetime | None = None
+    last_seen_version: str | None = None
+
+class AgentToken:
+    id: UUID = PK
+    token_hash: str = unique-indexed     # SHA-256 hex of the bearer
+    device: str = FK(Device.slug)
+    created_at: datetime
+    revoked_at: datetime | None = None
+
+class Plugin:
+    type: str = PK (composite)
+    instance_id: str = PK (composite, default "default")
+    config: dict[str, Any] = {}
+    users: list[str] = []            # JSON; user slugs or ["*"] (renamed from governs)
+    paused: bool = False
+
+class UserLock:
+    user: str = PK + FK(User.slug)
+    manual_lock: bool = False
+    set_at: datetime
+    set_by: str | None = None        # actor identifier (root token == "operator", else user slug)
+
+class AuditLog:
+    id: int = PK (autoincrement)
+    actor: str
+    action: str                      # e.g. "user.lock", "plugin.assign"
+    target_kind: AuditTargetKind
+    target_id: str                   # the target's slug (or other identifier)
+    payload: dict[str, Any] = {}     # JSON; action-specific
+    occurred_at: datetime            # indexed for retention pruning
+
+class Manifest:
+    type: str = PK                   # one row per agent type (e.g. "windows-agent")
+    version: str
+    sha256: str
+    url: str                         # renamed from agent_url
+
+class Settings:
+    id: int = PK + CHECK(id = 1)
+    agent_tick_seconds: int = 60
+    manifest_tick_seconds: int = 3600
+    plugin_resync_seconds: int = 300
+    plugin_reconcile_timeout_seconds: int = 30
+    audit_retention_days: int = 90
+```
+
+Indexes added beyond PKs:
+- `audit_log(occurred_at)` — retention pruning sweeps by date.
+- `audit_log(target_kind, target_id)` — "all events for kid1".
+- `agent_tokens(token_hash)` UNIQUE — auth-path lookup.
+- `agent_tokens(device, revoked_at)` — list-active-tokens queries.
+
+## File layout
 
 ```
-curfew/
-├── pyproject.toml                  # workspace root: [tool.uv.workspace] + shared ruff/mypy/pytest config
-├── uv.lock                         # single lockfile across the workspace
-├── core/                           # shared lib: models, schemas, rule pipeline, Plugin base
-│   ├── pyproject.toml
-│   ├── curfew/                     # importable as `from curfew.models import ...`
-│   │   └── __init__.py
-│   └── tests/
-├── api/                            # FastAPI service (curfew-core's HTTP layer)
-│   ├── pyproject.toml
-│   ├── Dockerfile                  # moved from docker/Dockerfile
-│   ├── curfew_api/
-│   │   └── __init__.py
-│   ├── migrations/                 # Alembic
-│   └── tests/
-├── cli/                            # operator CLI
-│   ├── pyproject.toml
-│   ├── curfew_cli/
-│   │   └── __init__.py
-│   └── tests/
-├── agents/
-│   ├── sdk-python/                 # Python agent SDK (publishable)
-│   │   ├── pyproject.toml
-│   │   ├── curfew_agent_sdk/       # renamed from curfew_agent_sdk_python (dir name says "python" already)
-│   │   │   └── __init__.py
-│   │   └── tests/
-│   ├── sdk-powershell/             # PowerShell module
-│   │   ├── README.md
-│   │   └── tests/                  # Pester (when SDK code lands)
-│   ├── windows-agent/              # uses sdk-powershell
-│   │   └── .gitkeep
-│   ├── macos-agent/                # uses sdk-python
-│   │   └── .gitkeep
-│   └── reftest-agent/              # reference test agent (was tests/reftest_agent/)
-│       └── .gitkeep
-├── plugins/                        # default CURFEW_PLUGINS_DIRS entry
-│   ├── reftest-plugin/             # reference test plugin (was tests/reftest_plugin/)
-│   │   └── .gitkeep
-│   └── .gitkeep                    # adguard/, smart_plug/, etc. land here later
-├── e2e/                            # docker-compose-up + CLI roundtrip + reftests exercised together
-│   └── .gitkeep
-├── docker/
-│   └── compose.yml                 # orchestration only; per-image Dockerfiles live next to their service
-├── docs/
-└── .github/workflows/
-    └── ci.yml
+core/
+├── curfew/
+│   ├── models.py             # NEW: all 10 SQLModel classes + enums + naming convention
+│   └── __init__.py           # re-exports models for `from curfew.models import User`
+└── tests/
+    └── test_models.py        # NEW: CRUD round-trips, FK behaviour, JSON, singleton CHECK
+
+api/
+├── alembic.ini               # NEW: script_location = migrations, sqlalchemy.url = sqlite:///./state.sqlite (env-var override)
+├── migrations/
+│   ├── env.py                # NEW: imports core.curfew.models, sets target_metadata
+│   ├── script.py.mako        # NEW: standard Alembic template
+│   └── versions/
+│       └── 0001_initial.py   # NEW: creates all 10 tables + INSERT into settings
+└── tests/
+    └── test_migration.py     # NEW: apply migration → reflect schema → assert tables + settings row
 ```
 
-**Key naming decisions** (all defensible; flag any to push back on):
+## Dep additions
 
-- `core/` for the shared lib — package name stays `curfew`, so `from curfew.models import User` works unchanged. Matches PLAN.md's "curfew-core" terminology without colliding with the running service (which is `core` + `api` + plugins packaged together).
-- `curfew_agent_sdk_python` → `curfew_agent_sdk`. The directory `sdk-python/` already encodes the language; the package name doesn't need to. PyPI name becomes `curfew-agent-sdk`.
-- Reference-test consumers move into their natural homes: `agents/reftest-agent/` and `plugins/reftest-plugin/`. PLAN.md's `tests/reftest_*` paths were the awkward middle ground (these are reference *implementations* that tests *use*, not tests themselves).
-- Per-component `tests/` directories — no top-level `tests/`. Cross-component lands in `e2e/`.
-- `Dockerfile` moves to `api/Dockerfile`. `docker/compose.yml` stays as the operator-facing orchestration file (Traefik wiring will land here later).
+- `core/pyproject.toml`: add `sqlmodel>=0.0.22`. (SQLModel pulls SQLAlchemy 2.0 + Pydantic v2 transitively.)
+- `api/pyproject.toml`: add `alembic>=1.13`.
+- `uv.lock`: regenerated by `uv lock`.
 
-## Files to create
+## Implementation steps
 
-### Root
-
-- `pyproject.toml` — workspace root. Keeps shared `[tool.ruff]`, `[tool.mypy]`, `[tool.pytest.ini_options]`. Adds `[tool.uv.workspace] members = ["core", "api", "cli", "agents/sdk-python"]`. Keeps `[dependency-groups] dev = [...]`. Removes `[tool.hatch.build.targets.wheel] packages = [...]` (each member declares its own wheel).
-- `uv.lock` — regenerated by `uv sync`.
-
-### Per-component `pyproject.toml`s (5 new files)
-
-- `core/pyproject.toml` — name `curfew`, hatchling, packages `["curfew"]`, no runtime deps yet.
-- `api/pyproject.toml` — name `curfew-api`, depends on `curfew` (the `core/` workspace member, declared via `[tool.uv.sources] curfew = { workspace = true }`).
-- `cli/pyproject.toml` — name `curfew-cli`, depends on `curfew` similarly.
-- `agents/sdk-python/pyproject.toml` — name `curfew-agent-sdk`, depends on `curfew` (it needs the shared types).
-- (No pyproject for `sdk-powershell/` — it's a PowerShell module, not a Python package.)
-
-### Per-component empty `__init__.py` and `tests/`
-
-- `core/curfew/__init__.py`
-- `api/curfew_api/__init__.py`
-- `api/migrations/.gitkeep` (Alembic-bound, populated in step 2)
-- `cli/curfew_cli/__init__.py`
-- `agents/sdk-python/curfew_agent_sdk/__init__.py`
-- `core/tests/__init__.py`, `api/tests/__init__.py`, `cli/tests/__init__.py`, `agents/sdk-python/tests/__init__.py`
-- `core/tests/test_skeleton.py` — import the package; replaces `tests/unit/test_skeleton.py`. Probably one trivial test per component.
-
-### `agents/sdk-powershell/README.md`
-
-Same as the current `src/curfew-agent-sdk-powershell/README.md` content (this is a PowerShell module, not a Python package).
-
-### `agents/{windows-agent,macos-agent,reftest-agent}/.gitkeep` + `plugins/{reftest-plugin,}/.gitkeep` + `e2e/.gitkeep`
-
-Empty placeholders; populated as features land.
-
-### `api/Dockerfile`
-
-Moved from `docker/Dockerfile`, paths adjusted (build context is now `api/`):
-
-```dockerfile
-FROM python:3.13-slim
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-WORKDIR /app
-COPY pyproject.toml uv.lock README.md ./
-COPY curfew_api ./curfew_api
-RUN uv sync --frozen --no-dev
-CMD ["uv", "run", "python", "-c", "print('curfew-core not yet implemented')"]
-```
-
-(Refined in step 2 once the FastAPI app actually exists.)
-
-## Files to modify
-
-- `docker/compose.yml` — `build.context` becomes `../api`, `build.dockerfile` becomes `Dockerfile`.
-- `.github/workflows/ci.yml` — `uv sync --group dev` at root still works (workspace-aware). Tool invocations stay (`uv run ruff check .`, `uv run mypy`, `uv run pytest`). May need `uv run pytest` to discover all per-component tests (default rootdir behaviour collects from each member; verify).
-- `.pre-commit-config.yaml` — no change needed (hooks already use `uv run`).
-- `docs/PLAN.md` §"Repository layout" — replace the tree with the new one. Also replace doc-body references: `curfew_agent_sdk_python` (4 hits) → `curfew_agent_sdk`; the SDK-table row paths and `## Reference test consumers` section.
-- `docs/DECISIONS.md` — append **ADR-014** (see outline below). Also fix the existing reference: line 160 `curfew_agent_sdk_python` → `curfew_agent_sdk`.
-- `docs/AGENTS.md` — fix two `curfew_agent_sdk_python` references (lines 92, 142) → `curfew_agent_sdk`.
-
-## Files to delete
-
-- `src/` — entire tree.
-- `tests/` (top-level) — including `tests/conftest.py`, `tests/unit/test_skeleton.py`, all six `tests/*/.gitkeep`. Each component owns its own tests now.
-- `docker/Dockerfile` — moved to `api/Dockerfile` (`git mv` preserves history).
-
-## Pending working-tree change to absorb
-
-The user has an uncommitted edit at `docs/PLAN.md` adding a "Status" section: *"This is a rough plan. Some of these ideas won't be well thought out. Please challenge ideas that could use improvement."* It's been sitting unstaged since before this branch existed. Since this commit already touches `docs/PLAN.md`, **roll the Status section into this commit** rather than leaving it dangling. (If the user prefers a separate commit, they can carve it out before pushing — but absorbing is the simpler default.)
-
-## ADR-014 outline (to append to `docs/DECISIONS.md`)
-
-Title: **ADR-014: Per-component flat layout, not Python `src/`**
-
-Sections:
-
-- **Decided:** Each top-level deliverable lives at its own root-level directory (`core/`, `api/`, `cli/`, `agents/sdk-python/`, `agents/sdk-powershell/`, `agents/<name>/`, `plugins/<name>/`, `e2e/`). Each Python deliverable owns a `pyproject.toml`. The root `pyproject.toml` is a uv workspace that ties them together. Tests live next to the code they test; cross-component integration lives in `e2e/`.
-- **Rejected:**
-  - **Single-pyproject `src/`-layout** (the just-scaffolded shape). Standard Python pattern, but treats independent deliverables as one package. Forces awkward homes for the PowerShell SDK and the reference-test consumers. Per-image Dockerfiles either pollute the root or copy unrelated code.
-  - **Monorepo with one published package and internal sub-packages.** Hides the fact that the SDKs are intended for third-party authors to install standalone.
-  - **One pyproject per directory but no workspace** (just multiple unrelated installs). Loses the single lockfile and the "one `uv sync` does everything" UX. uv workspaces are the right tool.
-- **Why now:** zero functional code exists; this is the cheapest moment. The three earlier audit-driven changes (uv, Python 3.13, pre-push hooks) all make this layout cheaper to maintain. PLAN.md's repo-layout section is updated alongside this ADR.
-- **Trade-offs accepted:**
-  - More `pyproject.toml` files (5). Cost dissolved by uv workspaces.
-  - Cross-component imports must be declared (`api/` lists `curfew` as a dep). This is correct, not friction — it surfaces the dependency graph.
-  - Per-component pytest invocations: `uv run pytest` from root still discovers all members.
-- **Why this is a kernel commitment:** the directory shape ships in the docs and is what plugin and agent authors anchor to. Changing it after the SDKs publish means breaking external paths.
+1. Branch off `main`: `storage-kernel`.
+2. Add deps: edit `core/pyproject.toml`, `api/pyproject.toml`. Run `uv lock`.
+3. Write `core/curfew/models.py` — all enums, all 10 SQLModel classes, MetaData naming convention.
+4. Write `core/curfew/__init__.py` re-exports for the public API.
+5. Bootstrap Alembic: `cd api && uv run alembic init --template generic migrations`. Replace generated `env.py` with a version that imports `core.curfew.models.SQLModel.metadata` as `target_metadata`. Set `alembic.ini`'s `script_location = migrations` and `sqlalchemy.url` to a default SQLite path overridable by `CURFEW_DB_PATH`.
+6. Generate the initial migration: `uv run alembic revision --autogenerate -m "initial schema"`. Hand-edit the generated file: rename to `0001_initial.py`, add the `INSERT INTO settings` seed in `upgrade()`, verify the CHECK constraints + indexes are present.
+7. Write `core/tests/test_models.py` (one test per model, plus singleton CHECK and FK behaviour).
+8. Write `api/tests/test_migration.py` (`alembic upgrade head` against a temp-file SQLite, then reflect and assert).
+9. **Update PLAN.md** — Tables row for users/devices/apps/plugins/manifests/audit_log/agent_tokens; Data-model concepts sections (User: drop `target_apps` row, rename `name`→`slug`; Device: drop LAPTOP from type enum, rename `name`→`slug`); Plugin lifecycle / CLI examples (`--governs` → `--users`); CLI shape table; "Per-rule user config — decision deferred" note (still applies, mentions `target_apps` will return there). **Update DECISIONS.md** ADR-006 reference to `agent_tokens` schema. Total: ~20 line edits across 2 files.
+10. Run `uv sync --all-packages --group dev`, `uv run ruff check .`, `uv run ruff format --check .`, `uv run mypy`, `uv run pytest`, `uv run pre-commit run --all-files`.
+11. Commit, push branch, open PR #5.
 
 ## Verification
 
-Run from the repo root in a fresh checkout:
+End-to-end checks:
+1. `uv sync --all-packages --group dev` — clean.
+2. `uv run python -c "from curfew.models import User, Device, App, Agent, AgentToken, Plugin, UserLock, AuditLog, Manifest, Settings; print('all import')"`.
+3. `uv run mypy` — clean.
+4. `uv run pytest` — all `core/tests/test_models.py` tests pass; the migration test passes.
+5. `cd api && uv run alembic upgrade head --sql` — emits the expected DDL (sanity check the generated SQL).
+6. `cd api && rm -f /tmp/curfew-test.sqlite && CURFEW_DB_PATH=/tmp/curfew-test.sqlite uv run alembic upgrade head` — apply against a real file. Then `sqlite3 /tmp/curfew-test.sqlite '.schema'` should show all 10 tables; `SELECT * FROM settings` should return one row with the documented defaults.
+7. `uv run ruff check .` and `uv run ruff format --check .` — clean.
+8. `uv run pre-commit run --all-files` — clean.
+9. Push → CI green.
 
-1. `rm -rf .venv && uv sync --group dev` — single sync covers all workspace members.
-2. `uv run python -c "import curfew, curfew_api, curfew_cli, curfew_agent_sdk"` — all four packages import.
-3. `uv run ruff check .` and `uv run ruff format --check .` — clean (path globs may need `core/`, `api/`, `cli/`, `agents/sdk-python/` replacements for the old `src/`).
-4. `uv run mypy` — `[tool.mypy] packages = ["curfew", "curfew_api"]` still works because uv workspaces install them in editable mode and they're importable.
-5. `uv run pytest` — collects per-component tests (one trivial test per component); all pass.
-6. `uv run pre-commit run --all-files` — clean.
-7. `docker build -f api/Dockerfile api/` — builds, runs, prints the placeholder, exits 0.
-8. `grep -rn 'src/curfew\|curfew_agent_sdk_python\|tests/reftest' docs/` returns nothing.
+## Critical files for the implementer to reference
+
+- `docs/PLAN.md` lines 63–119 (Tables + Data model concepts).
+- `docs/PLAN.md` lines 315–325 (Settings table fields and defaults).
+- `docs/PLAN.md` lines 329–337 (Auth + audit log).
+- `docs/PLAN.md` lines 380–391 (API surface — informs `users.role`, `device.type`, `device.os`, `audit_log.action` enum values).
+- `docs/DECISIONS.md` ADR-002 (SQLite + SQLModel + Alembic from day one).
+- `docs/DECISIONS.md` ADR-006 (per-device bearer tokens, hashed at rest).
+- `docs/DECISIONS.md` ADR-007 (`agents` table single-row-per-device with declarative + runtime columns).
+- `core/pyproject.toml`, `api/pyproject.toml` (where deps land).
 
 ## Branch sequencing
 
-- New branch off `main` (PR #2 already merged): `layout-flat-workspace`.
-- Single commit covering the migration + the ADR + the user's "Status" section absorption.
-- Open PR #3.
-- Stale branch on origin (`scaffold-skeleton`, `audit-uv-py313`) cleanup is the user's call (I am policy-blocked from deleting remote branches).
-
-## Critical files for the implementer
-
-- `docs/PLAN.md` lines 428–474 (current "Repository layout" tree to replace).
-- `docs/DECISIONS.md` line 229+ (where ADR-014 appends after ADR-013).
-- `docs/AGENTS.md` lines 92, 142 (`curfew_agent_sdk_python` refs).
-- `pyproject.toml` (root) — strip wheel-packages block, add `[tool.uv.workspace]`.
-- `.github/workflows/ci.yml` — verify ruff/mypy/pytest invocations don't reference `src/`.
-- `.pre-commit-config.yaml` — verify no `src/` references (currently none).
+- Branch: `storage-kernel` off `main`.
+- Single commit covering: deps, models, migration, Alembic config, tests.
+- Open PR #5.
+- Quick-win parallel PRs (LICENSE, dependabot, CONTRIBUTING) can come before, after, or alongside — not blocked.

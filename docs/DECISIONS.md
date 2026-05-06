@@ -102,14 +102,14 @@ A plugin is a Python class subclassing `Plugin` from the plugin SDK. Curfew-core
 **Decided:** desired state is declared in the database; runtime data either projects from it or is irrelevant.
 
 - **Agents:** `agents(device, type, config, last_heartbeat, last_seen_version)` — one row per device that has an agent installed. Declarative columns (`type`, `config`) are set at install; runtime columns (`last_heartbeat`, `last_seen_version`) start NULL and are updated by the agent's heartbeat. The kernel deliberately does *not* paint stale heartbeats as an alert — a powered-off device looks identical to a broken agent without independent reachability evidence (see the Reachability monitoring feature in PLAN.md). The desired/runtime split lives within one row rather than across two tables: the runtime side carries only two columns and never drifts independently from desired (no reconciliation controller; the agent reports back), so a separate projection table earned no keep.
-- **Plugins:** `plugins(type, instance_id, config, governs, paused)` declares which plugins are assigned and how. There's no separate runtime-state table because plugins are in-process — their liveness *is* the core's. An assigned-but-paused plugin has its row but is skipped during reconciliation.
+- **Plugins:** `plugins(type, instance_id, config, users, paused)` declares which plugins are assigned and how. There's no separate runtime-state table because plugins are in-process — their liveness *is* the core's. An assigned-but-paused plugin has its row but is skipped during reconciliation.
 
 **Rejected:**
 
 - **Pure self-announcement** (agent announces itself on first heartbeat; no database declaration). Loses the ability to distinguish "agent broken" from "agent uninstalled" — both look like silence.
 - **Pure declarative for agents** (no heartbeats). Loses the liveness signal — operator never knows whether the agent is actually running.
 
-**Why `governs` lives on `plugins` only:** an agent is bound to a device, and the device's `owner` determines the user it governs (or operates at device scope when `owner` is null). Plugins aren't bound to a device — `governs` is an explicit list (`["kid1", "kid2"]` or `["*"]`) because there's no implicit device-to-user link.
+**Why `users` (the governed-user list) lives on `plugins` only:** an agent is bound to a device, and the device's `owner` determines the user it governs (or operates at device scope when `owner` is null). Plugins aren't bound to a device — `users` is an explicit list (`["kid1", "kid2"]` or `["*"]`) because there's no implicit device-to-user link.
 
 ## ADR-008: Lock status is a scoped rule pipeline
 
