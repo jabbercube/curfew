@@ -1,0 +1,7 @@
+services:
+  curfew-core:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ./state:/var/lib/curfew
