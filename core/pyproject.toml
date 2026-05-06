@@ -1,0 +1,13 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "curfew"
+version = "0.0.0"
+description = "Shared library: models, schemas, rule pipeline, Plugin base class"
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = ["curfew"]

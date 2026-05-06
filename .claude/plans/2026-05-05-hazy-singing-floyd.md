@@ -1,109 +1,183 @@
-# Step 1 — Repository skeleton
+# Step 1.5 — Per-component flat layout + ADR-014
 
 ## Context
 
-The repo is in pure planning state — `docs/`, `README.md`, and `.claude/` only. PLAN.md commits to a kernel-first build: build a complete kernel (storage, FastAPI core, two SDKs, CLI, reference test consumers, end-to-end acceptance) before any feature work, in any internal order.
+The just-scaffolded `src/`-layout (PR #1, PR #2) puts every Python package under one root `pyproject.toml` and a top-level `tests/` tree. PLAN.md adopted that without explicit justification — it's the soft Python default. After a tool-choice audit (PR #2 switched the project to uv) and a reread of how the components actually ship — agent SDKs published for third-party agent authors, `windows-agent` distributed as a tarball, CLI shipped to operator laptops, `curfew-core` shipped as a Docker image, in-core plugins drop-in'd into a discovery directory — the components are independent deliverables, not one big package. An Immich-style **per-component flat layout** matches the deliverables, plays well with uv workspaces (just adopted), gives the awkward PowerShell SDK and reference-test consumers natural homes, and per-image Dockerfiles co-locate with their service.
 
-Step 1 lays down the **repository skeleton** that every subsequent kernel slice will commit into: the directory tree from PLAN.md §"Repository layout", a single root `pyproject.toml` configuring lint/type/test, pre-commit, stub Dockerfile + compose, and a green Linux CI workflow running `ruff + mypy + pytest` on an empty test suite. **No functional code.** The point is to make every later commit land in a structured, lint-passing, CI-green repo from line 1.
+This step migrates while there is **zero functional code**: pure directory shuffle, per-package `pyproject.toml`s, `[tool.uv.workspace]` at root, doc updates, and a new ADR. Cost now ≈ 45 min. Cost in 6 months once code lands ≈ multi-day refactor.
 
-Why this first: it is small, has unambiguous done criteria (CI green), is dictated almost entirely by PLAN.md (so design surface is near-zero), and unblocks every other slice. Storage models, the FastAPI app, the SDKs, the CLI, and the reference test consumers all want to land into the directory tree this step creates.
+User has explicitly endorsed the proposed shape ("this is perfect") and asked for the matching ADR ("also add a decision"). PR #2 is already merged on `main`, so this is a fresh branch off `main`.
 
-## Scope confirmed with user
+## Target layout
 
-- **Skeleton only** — no SQLModel models, no FastAPI app, no Alembic migrations yet.
-- **src-layout, multi-package**, exactly as PLAN.md §"Repository layout" describes.
-- One `pyproject.toml` at root for now (all `src/*` packages discoverable from one install). Per-package `pyproject.toml` split is deferred until the first agent SDK actually ships and needs independent publishing.
+```
+curfew/
+├── pyproject.toml                  # workspace root: [tool.uv.workspace] + shared ruff/mypy/pytest config
+├── uv.lock                         # single lockfile across the workspace
+├── core/                           # shared lib: models, schemas, rule pipeline, Plugin base
+│   ├── pyproject.toml
+│   ├── curfew/                     # importable as `from curfew.models import ...`
+│   │   └── __init__.py
+│   └── tests/
+├── api/                            # FastAPI service (curfew-core's HTTP layer)
+│   ├── pyproject.toml
+│   ├── Dockerfile                  # moved from docker/Dockerfile
+│   ├── curfew_api/
+│   │   └── __init__.py
+│   ├── migrations/                 # Alembic
+│   └── tests/
+├── cli/                            # operator CLI
+│   ├── pyproject.toml
+│   ├── curfew_cli/
+│   │   └── __init__.py
+│   └── tests/
+├── agents/
+│   ├── sdk-python/                 # Python agent SDK (publishable)
+│   │   ├── pyproject.toml
+│   │   ├── curfew_agent_sdk/       # renamed from curfew_agent_sdk_python (dir name says "python" already)
+│   │   │   └── __init__.py
+│   │   └── tests/
+│   ├── sdk-powershell/             # PowerShell module
+│   │   ├── README.md
+│   │   └── tests/                  # Pester (when SDK code lands)
+│   ├── windows-agent/              # uses sdk-powershell
+│   │   └── .gitkeep
+│   ├── macos-agent/                # uses sdk-python
+│   │   └── .gitkeep
+│   └── reftest-agent/              # reference test agent (was tests/reftest_agent/)
+│       └── .gitkeep
+├── plugins/                        # default CURFEW_PLUGINS_DIRS entry
+│   ├── reftest-plugin/             # reference test plugin (was tests/reftest_plugin/)
+│   │   └── .gitkeep
+│   └── .gitkeep                    # adguard/, smart_plug/, etc. land here later
+├── e2e/                            # docker-compose-up + CLI roundtrip + reftests exercised together
+│   └── .gitkeep
+├── docker/
+│   └── compose.yml                 # orchestration only; per-image Dockerfiles live next to their service
+├── docs/
+└── .github/workflows/
+    └── ci.yml
+```
 
-## Tooling choices
+**Key naming decisions** (all defensible; flag any to push back on):
 
-| Concern | Choice | Why |
-|---|---|---|
-| Build backend | `hatchling` | PyPA-standard, lightweight, no opinion on installer. |
-| Installer | `pip` (CI) / `uv` (local, optional) | Standard install path; `uv` works against the same `pyproject.toml` if a contributor wants it. |
-| Python floor | `>=3.12` | FastAPI + Pydantic v2 + SQLModel all support it; modern type syntax. CI on 3.13. |
-| Linter + formatter | `ruff` | PLAN.md §"Testing strategy" specifies `ruff + mypy + pytest`. |
-| Type checker | `mypy --strict` for `src/curfew/` and `src/curfew_api/` | PLAN.md: "`mypy --strict` for the core". The SDKs and CLI start non-strict; tighten later. |
-| Test framework | `pytest` | PLAN.md specifies. |
-| Git hooks | `pre-commit` framework, **installed at the `pre-push` stage** (not commit stage) | Run lint/type checks once before pushing instead of on every WIP commit. PLAN.md says "Pre-commit hooks for lint/format" — same tool, different stage. Configured via `default_install_hook_types: [pre-push]` in `.pre-commit-config.yaml`; contributors run `pre-commit install` once. |
-| CI | One GitHub Actions workflow (`.github/workflows/ci.yml`) | The Windows workflow (`windows.yml` per PLAN.md) is **deferred** until PowerShell code exists — there's nothing to test on Windows yet. Add a second workflow when the PowerShell SDK lands. |
+- `core/` for the shared lib — package name stays `curfew`, so `from curfew.models import User` works unchanged. Matches PLAN.md's "curfew-core" terminology without colliding with the running service (which is `core` + `api` + plugins packaged together).
+- `curfew_agent_sdk_python` → `curfew_agent_sdk`. The directory `sdk-python/` already encodes the language; the package name doesn't need to. PyPI name becomes `curfew-agent-sdk`.
+- Reference-test consumers move into their natural homes: `agents/reftest-agent/` and `plugins/reftest-plugin/`. PLAN.md's `tests/reftest_*` paths were the awkward middle ground (these are reference *implementations* that tests *use*, not tests themselves).
+- Per-component `tests/` directories — no top-level `tests/`. Cross-component lands in `e2e/`.
+- `Dockerfile` moves to `api/Dockerfile`. `docker/compose.yml` stays as the operator-facing orchestration file (Traefik wiring will land here later).
 
 ## Files to create
 
 ### Root
 
-- `pyproject.toml` — hatchling build backend, packages discovered from `src/` (`curfew`, `curfew_api`, `curfew_cli`, `curfew_agent_sdk_python`), Python `>=3.12`, dev-dep group `[ruff, mypy, pytest, pytest-asyncio, pre-commit, types-*]`, runtime deps left empty for step 1, `[tool.ruff]` + `[tool.mypy]` + `[tool.pytest.ini_options]` blocks.
-- `.gitignore` — append standard Python ignores (`__pycache__/`, `*.pyc`, `.venv/`, `dist/`, `*.egg-info/`, `.mypy_cache/`, `.ruff_cache/`, `.pytest_cache/`, `.coverage`, `htmlcov/`). Preserve current content (currently a blank line).
-- `.pre-commit-config.yaml` — ruff (lint + format) + mypy hooks, with `default_install_hook_types: [pre-push]` so `pre-commit install` wires them as pre-**push** hooks. (Despite the framework's name, it supports any git hook stage; "pre-commit" is the package, "pre-push" is the stage we install at.)
-- `.python-version` — `3.13` (developer hint; CI is authoritative).
+- `pyproject.toml` — workspace root. Keeps shared `[tool.ruff]`, `[tool.mypy]`, `[tool.pytest.ini_options]`. Adds `[tool.uv.workspace] members = ["core", "api", "cli", "agents/sdk-python"]`. Keeps `[dependency-groups] dev = [...]`. Removes `[tool.hatch.build.targets.wheel] packages = [...]` (each member declares its own wheel).
+- `uv.lock` — regenerated by `uv sync`.
 
-### Source tree (each package gets `__init__.py` only — empty packages, no functional code)
+### Per-component `pyproject.toml`s (5 new files)
 
-- `src/curfew/__init__.py` — shared library: future home of models, schemas, rule interface, `Plugin` base class.
-- `src/curfew_api/__init__.py` — FastAPI service.
-- `src/curfew_api/migrations/.gitkeep` — Alembic dir, populated in the storage step.
-- `src/curfew_cli/__init__.py` — CLI client.
-- `src/curfew_agent_sdk_python/__init__.py` — Python agent SDK.
-- `src/curfew-agent-sdk-powershell/.gitkeep` — PowerShell module, populated when the PowerShell SDK lands. Note in a sibling `README.md` that this is **not** a Python package despite living under `src/`.
+- `core/pyproject.toml` — name `curfew`, hatchling, packages `["curfew"]`, no runtime deps yet.
+- `api/pyproject.toml` — name `curfew-api`, depends on `curfew` (the `core/` workspace member, declared via `[tool.uv.sources] curfew = { workspace = true }`).
+- `cli/pyproject.toml` — name `curfew-cli`, depends on `curfew` similarly.
+- `agents/sdk-python/pyproject.toml` — name `curfew-agent-sdk`, depends on `curfew` (it needs the shared types).
+- (No pyproject for `sdk-powershell/` — it's a PowerShell module, not a Python package.)
 
-### Empty-but-tracked dirs (with `.gitkeep`)
+### Per-component empty `__init__.py` and `tests/`
 
-Mirroring PLAN.md §"Repository layout":
+- `core/curfew/__init__.py`
+- `api/curfew_api/__init__.py`
+- `api/migrations/.gitkeep` (Alembic-bound, populated in step 2)
+- `cli/curfew_cli/__init__.py`
+- `agents/sdk-python/curfew_agent_sdk/__init__.py`
+- `core/tests/__init__.py`, `api/tests/__init__.py`, `cli/tests/__init__.py`, `agents/sdk-python/tests/__init__.py`
+- `core/tests/test_skeleton.py` — import the package; replaces `tests/unit/test_skeleton.py`. Probably one trivial test per component.
 
-- `agents/windows-agent/.gitkeep`, `agents/macos-agent/.gitkeep`
-- `plugins/.gitkeep` — default entry in `CURFEW_PLUGINS_DIRS`; populated when the first plugin (or `reftest_plugin`) lands.
-- `tests/unit/.gitkeep`, `tests/api/.gitkeep`, `tests/cli/.gitkeep`, `tests/reftest_agent/.gitkeep`, `tests/reftest_plugin/.gitkeep`, `tests/e2e/.gitkeep`
-- `tests/conftest.py` — empty; lets pytest discover the dir.
+### `agents/sdk-powershell/README.md`
 
-### Docker
+Same as the current `src/curfew-agent-sdk-powershell/README.md` content (this is a PowerShell module, not a Python package).
 
-- `docker/Dockerfile` — multi-stage stub: base on `python:3.13-slim`, install the project via `pip install -e .`, set `CMD` to a placeholder that prints "curfew-core not yet implemented" and exits 0. Replaced when the FastAPI app lands.
-- `docker/compose.yml` — single `curfew-core` service, mounts `./state:/var/lib/curfew` for the future SQLite volume, exposes nothing yet, no Traefik wiring (added later).
+### `agents/{windows-agent,macos-agent,reftest-agent}/.gitkeep` + `plugins/{reftest-plugin,}/.gitkeep` + `e2e/.gitkeep`
 
-### CI
+Empty placeholders; populated as features land.
 
-- `.github/workflows/ci.yml` — on push + PR: checkout, setup Python 3.13, `pip install -e .[dev]`, `ruff check`, `ruff format --check`, `mypy src/curfew src/curfew_api`, `pytest`. Pytest runs against `tests/` which is empty — passes with "no tests collected" (use `--exitfirst` not required; default exit 0 on no tests once `[tool.pytest.ini_options]` sets `testpaths = ["tests"]` and pytest is configured to allow empty collection via `# no special flag — pytest exits 5 on no tests; we add a single trivial test in tests/unit/test_skeleton.py asserting True so collection is non-empty`).
+### `api/Dockerfile`
 
-### Trivial smoke test
+Moved from `docker/Dockerfile`, paths adjusted (build context is now `api/`):
 
-- `tests/unit/test_skeleton.py` — one test: `def test_packages_import(): import curfew, curfew_api, curfew_cli, curfew_agent_sdk_python`. Confirms the install + imports work and gives pytest something to collect.
+```dockerfile
+FROM python:3.13-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md ./
+COPY curfew_api ./curfew_api
+RUN uv sync --frozen --no-dev
+CMD ["uv", "run", "python", "-c", "print('curfew-core not yet implemented')"]
+```
+
+(Refined in step 2 once the FastAPI app actually exists.)
 
 ## Files to modify
 
-- `.gitignore` — append Python ignores (preserving the empty current content).
-- `README.md` — leave alone; it already points at the docs.
+- `docker/compose.yml` — `build.context` becomes `../api`, `build.dockerfile` becomes `Dockerfile`.
+- `.github/workflows/ci.yml` — `uv sync --group dev` at root still works (workspace-aware). Tool invocations stay (`uv run ruff check .`, `uv run mypy`, `uv run pytest`). May need `uv run pytest` to discover all per-component tests (default rootdir behaviour collects from each member; verify).
+- `.pre-commit-config.yaml` — no change needed (hooks already use `uv run`).
+- `docs/PLAN.md` §"Repository layout" — replace the tree with the new one. Also replace doc-body references: `curfew_agent_sdk_python` (4 hits) → `curfew_agent_sdk`; the SDK-table row paths and `## Reference test consumers` section.
+- `docs/DECISIONS.md` — append **ADR-014** (see outline below). Also fix the existing reference: line 160 `curfew_agent_sdk_python` → `curfew_agent_sdk`.
+- `docs/AGENTS.md` — fix two `curfew_agent_sdk_python` references (lines 92, 142) → `curfew_agent_sdk`.
 
-## What this step explicitly does **not** do
+## Files to delete
 
-- No SQLModel models, no Alembic env, no migrations.
-- No FastAPI app — `curfew_api/__init__.py` is empty; no `main.py` yet.
-- No CLI commands — `curfew_cli/__init__.py` is empty; no Typer/argparse yet.
-- No agent SDK code, no plugin SDK code, no `Plugin` base class.
-- No Windows CI workflow (deferred to the step that introduces the PowerShell SDK).
-- No Traefik wiring in `compose.yml` (deferred to the step that exposes a real port).
-- No reference test consumers (`reftest_agent`, `reftest_plugin`).
+- `src/` — entire tree.
+- `tests/` (top-level) — including `tests/conftest.py`, `tests/unit/test_skeleton.py`, all six `tests/*/.gitkeep`. Each component owns its own tests now.
+- `docker/Dockerfile` — moved to `api/Dockerfile` (`git mv` preserves history).
+
+## Pending working-tree change to absorb
+
+The user has an uncommitted edit at `docs/PLAN.md` adding a "Status" section: *"This is a rough plan. Some of these ideas won't be well thought out. Please challenge ideas that could use improvement."* It's been sitting unstaged since before this branch existed. Since this commit already touches `docs/PLAN.md`, **roll the Status section into this commit** rather than leaving it dangling. (If the user prefers a separate commit, they can carve it out before pushing — but absorbing is the simpler default.)
+
+## ADR-014 outline (to append to `docs/DECISIONS.md`)
+
+Title: **ADR-014: Per-component flat layout, not Python `src/`**
+
+Sections:
+
+- **Decided:** Each top-level deliverable lives at its own root-level directory (`core/`, `api/`, `cli/`, `agents/sdk-python/`, `agents/sdk-powershell/`, `agents/<name>/`, `plugins/<name>/`, `e2e/`). Each Python deliverable owns a `pyproject.toml`. The root `pyproject.toml` is a uv workspace that ties them together. Tests live next to the code they test; cross-component integration lives in `e2e/`.
+- **Rejected:**
+  - **Single-pyproject `src/`-layout** (the just-scaffolded shape). Standard Python pattern, but treats independent deliverables as one package. Forces awkward homes for the PowerShell SDK and the reference-test consumers. Per-image Dockerfiles either pollute the root or copy unrelated code.
+  - **Monorepo with one published package and internal sub-packages.** Hides the fact that the SDKs are intended for third-party authors to install standalone.
+  - **One pyproject per directory but no workspace** (just multiple unrelated installs). Loses the single lockfile and the "one `uv sync` does everything" UX. uv workspaces are the right tool.
+- **Why now:** zero functional code exists; this is the cheapest moment. The three earlier audit-driven changes (uv, Python 3.13, pre-push hooks) all make this layout cheaper to maintain. PLAN.md's repo-layout section is updated alongside this ADR.
+- **Trade-offs accepted:**
+  - More `pyproject.toml` files (5). Cost dissolved by uv workspaces.
+  - Cross-component imports must be declared (`api/` lists `curfew` as a dep). This is correct, not friction — it surfaces the dependency graph.
+  - Per-component pytest invocations: `uv run pytest` from root still discovers all members.
+- **Why this is a kernel commitment:** the directory shape ships in the docs and is what plugin and agent authors anchor to. Changing it after the SDKs publish means breaking external paths.
 
 ## Verification
 
-End-to-end checks the implementer should run (and CI must pass) before declaring step 1 done:
+Run from the repo root in a fresh checkout:
 
-1. `pip install -e .[dev]` — installs cleanly in a fresh venv.
-2. `python -c "import curfew, curfew_api, curfew_cli, curfew_agent_sdk_python"` — all four packages importable.
-3. `ruff check .` — clean.
-4. `ruff format --check .` — clean.
-5. `mypy src/curfew src/curfew_api` — clean (passes vacuously on empty packages with `--strict`).
-6. `pytest` — passes (one trivial test).
-7. `pre-commit install` (one-time) wires the hooks at the `pre-push` stage (not commit stage); `pre-commit run --all-files` — clean. A `git commit` does **not** trigger the hooks; a `git push` does.
-8. `docker build -f docker/Dockerfile .` — builds, image runs, prints the placeholder, exits 0.
-9. Push to a branch / open PR → GitHub Actions `ci.yml` workflow goes green.
+1. `rm -rf .venv && uv sync --group dev` — single sync covers all workspace members.
+2. `uv run python -c "import curfew, curfew_api, curfew_cli, curfew_agent_sdk"` — all four packages import.
+3. `uv run ruff check .` and `uv run ruff format --check .` — clean (path globs may need `core/`, `api/`, `cli/`, `agents/sdk-python/` replacements for the old `src/`).
+4. `uv run mypy` — `[tool.mypy] packages = ["curfew", "curfew_api"]` still works because uv workspaces install them in editable mode and they're importable.
+5. `uv run pytest` — collects per-component tests (one trivial test per component); all pass.
+6. `uv run pre-commit run --all-files` — clean.
+7. `docker build -f api/Dockerfile api/` — builds, runs, prints the placeholder, exits 0.
+8. `grep -rn 'src/curfew\|curfew_agent_sdk_python\|tests/reftest' docs/` returns nothing.
 
-## Critical files for the implementer to reference
+## Branch sequencing
 
-- `docs/PLAN.md` §"Repository layout" — authoritative directory tree.
-- `docs/PLAN.md` §"Testing strategy" — confirms `ruff + mypy + pytest` stack and the eventual Windows runner.
-- `docs/PLAN.md` §"Configuration and settings" — informs (but doesn't yet drive) future `BaseSettings` work.
-- `docs/DECISIONS.md` ADR-002 — SQLite + SQLModel + Alembic commitment that step 2 will land.
-- `.gitignore` (currently empty) — preserve and extend.
+- New branch off `main` (PR #2 already merged): `layout-flat-workspace`.
+- Single commit covering the migration + the ADR + the user's "Status" section absorption.
+- Open PR #3.
+- Stale branch on origin (`scaffold-skeleton`, `audit-uv-py313`) cleanup is the user's call (I am policy-blocked from deleting remote branches).
 
-## What step 2 looks like (for context only — not part of this step)
+## Critical files for the implementer
 
-Storage kernel: SQLModel models for every kernel table in PLAN.md §"Tables" + initial Alembic migration creating them all + the single `settings` row with defaults. Lands in `src/curfew/models.py` (or split files) and `src/curfew_api/migrations/`. Step 1's `mypy --strict` config and pre-commit hooks make this land cleanly without churn.
+- `docs/PLAN.md` lines 428–474 (current "Repository layout" tree to replace).
+- `docs/DECISIONS.md` line 229+ (where ADR-014 appends after ADR-013).
+- `docs/AGENTS.md` lines 92, 142 (`curfew_agent_sdk_python` refs).
+- `pyproject.toml` (root) — strip wheel-packages block, add `[tool.uv.workspace]`.
+- `.github/workflows/ci.yml` — verify ruff/mypy/pytest invocations don't reference `src/`.
+- `.pre-commit-config.yaml` — verify no `src/` references (currently none).

@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "curfew-api"
+version = "0.0.0"
+description = "FastAPI service — curfew-core's HTTP layer"
+requires-python = ">=3.13"
+dependencies = ["curfew"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["curfew_api"]
+
+[tool.uv.sources]
+curfew = { workspace = true }

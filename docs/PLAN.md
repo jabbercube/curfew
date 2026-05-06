@@ -2,6 +2,10 @@
 
 CLI- and (later) web-driven tool to manage screentime across the household. Built around an **API-first** architecture: a small dockerized core service holds state and exposes an HTTP API. Two extension surfaces implement enforcement — **agents** on managed devices (Windows PC lockout, future Mac/Linux) and **plugins** in-core (DNS sinkhole, smart plugs, router ACLs, etc.). New enforcement methods are added by writing new agents or plugins. The CLI and a future GUI are both thin clients of the same API.
 
+## Status
+
+This is a rough plan.  Some of these ideas won't be well thought out.  Please challenge ideas that could use improvement.
+
 ## Goals
 
 1. **Modular** — each enforcement method is an independent agent or plugin.
@@ -209,8 +213,8 @@ Two distinct SDKs because agents and plugins are different shapes:
 
 Polling-loop SDK with two flavors. An agent author writes a reconciler; the SDK runs the loop, the heartbeat, the manifest fetch, the hash verification, and the error reporting.
 
-- **`curfew_agent_sdk_python`** — for `macos-agent` and any future Linux/macOS agent.
-- **`curfew-agent-sdk-powershell`** — for `windows-agent` and any future Windows agent.
+- **`curfew_agent_sdk`** — for `macos-agent` and any future Linux/macOS agent.
+- **`curfew-agent-sdk`** — for `windows-agent` and any future Windows agent.
 
 Both expose:
 
@@ -267,13 +271,13 @@ Both live in the test suite; they're what the kernel acceptance test runs agains
 
 | Consumer | Kind | Where it runs | SDK |
 |---|---|---|---|
-| `windows-agent` | agent | Windows PC | `curfew-agent-sdk-powershell` |
-| `macos-agent` | agent | macOS device | `curfew_agent_sdk_python` |
+| `windows-agent` | agent | Windows PC | `curfew-agent-sdk` |
+| `macos-agent` | agent | macOS device | `curfew_agent_sdk` |
 | `adguard` | plugin | in-core (curfew-core process) | plugin SDK |
 | `smart-plug` | plugin | in-core | plugin SDK |
 | `router-acl` | plugin | in-core | plugin SDK |
 | `tailscale-acl` | plugin | in-core | plugin SDK |
-| `reftest_agent` | agent (test) | test harness | `curfew_agent_sdk_python` |
+| `reftest_agent` | agent (test) | test harness | `curfew_agent_sdk` |
 | `reftest_plugin` | plugin (test) | in-core | plugin SDK |
 
 ## Configuration and settings
@@ -423,25 +427,44 @@ curfew status                                                # human-readable su
 
 ## Repository layout
 
+Per-component flat layout (see ADR-014). Each top-level directory is an independent deliverable: `core/` is the shared library, `api/` is the FastAPI service, `cli/` is the operator CLI, agent SDKs and on-device agents live under `agents/`, in-core plugins under `plugins/`. The root `pyproject.toml` is a uv workspace that ties the Python deliverables together; each member owns its own `pyproject.toml` and `tests/` directory.
+
 ```
 curfew/
-├── src/
-│   ├── curfew/                        # shared library — models, schemas, rule interface, Plugin base class
-│   ├── curfew_api/                    # FastAPI service
-│   │   └── migrations/                # Alembic
-│   ├── curfew_cli/                    # CLI — thin HTTP client
-│   ├── curfew_agent_sdk_python/       # Python agent SDK (polling, heartbeat, self-update)
-│   └── curfew-agent-sdk-powershell/   # PowerShell agent SDK module (parallel, for Windows)
+├── pyproject.toml                  # workspace root: [tool.uv.workspace] + shared ruff/mypy/pytest config
+├── uv.lock                         # single lockfile across the workspace
+├── core/                           # shared library — models, schemas, rule interface, Plugin base class
+│   ├── pyproject.toml
+│   ├── curfew/                     # importable as `from curfew.models import ...`
+│   └── tests/
+├── api/                            # FastAPI service (curfew-core's HTTP layer)
+│   ├── pyproject.toml
+│   ├── Dockerfile                  # the curfew-core image
+│   ├── curfew_api/
+│   ├── migrations/                 # Alembic
+│   └── tests/
+├── cli/                            # operator CLI — thin HTTP client of the API
+│   ├── pyproject.toml
+│   ├── curfew_cli/
+│   └── tests/
 ├── agents/
+│   ├── sdk-python/                 # Python agent SDK (polling, heartbeat, self-update)
+│   │   ├── pyproject.toml
+│   │   ├── curfew_agent_sdk/
+│   │   └── tests/
+│   ├── sdk-powershell/             # PowerShell agent SDK module (parallel, for Windows)
+│   │   └── tests/                  # Pester tests
 │   ├── windows-agent/
-│   │   ├── agent.ps1                  # uses the PowerShell agent SDK
-│   │   ├── install-agent.ps1          # bootstrap installer
-│   │   └── tests/                     # Pester tests
-│   └── macos-agent/
-│       ├── agent.py                   # uses the Python agent SDK
-│       ├── install-agent.sh           # bootstrap installer
-│       └── tests/
-├── plugins/                           # in-core plugins — shipped with curfew
+│   │   ├── agent.ps1               # uses sdk-powershell
+│   │   ├── install-agent.ps1       # bootstrap installer
+│   │   └── tests/                  # Pester tests
+│   ├── macos-agent/
+│   │   ├── agent.py                # uses sdk-python
+│   │   ├── install-agent.sh        # bootstrap installer
+│   │   └── tests/
+│   └── reftest-agent/              # reference test agent (sdk-python consumer)
+├── plugins/                        # in-core plugins — default CURFEW_PLUGINS_DIRS entry
+│   ├── reftest-plugin/             # reference test plugin (manifest.toml + plugin.py)
 │   ├── adguard/
 │   │   ├── manifest.toml
 │   │   ├── plugin.py
@@ -449,26 +472,18 @@ curfew/
 │   ├── smart_plug/
 │   │   ├── manifest.toml
 │   │   └── plugin.py
-│   └── ...                            # router-acl, tailscale-acl, etc.
-├── tests/
-│   ├── unit/                          # models, schemas, rule pipeline, SDKs
-│   ├── api/                           # FastAPI TestClient integration tests
-│   ├── cli/                           # CLI against a mocked or real API
-│   ├── reftest_agent/                 # reference test agent (Python agent SDK consumer)
-│   ├── reftest_plugin/                # reference test plugin (manifest.toml + plugin.py)
-│   └── e2e/                           # docker-compose-up + CLI roundtrip + both reftests
+│   └── ...                         # router-acl, tailscale-acl, etc.
+├── e2e/                            # cross-component integration: docker-compose-up + CLI roundtrip + reftests
 ├── docker/
-│   ├── Dockerfile
-│   └── compose.yml
+│   └── compose.yml                 # operator orchestration (api/Dockerfile lives next to its service)
 ├── docs/
 │   ├── PLAN.md
 │   ├── DECISIONS.md
-│   ├── AGENTS.md                      # how to author and operate agents
-│   └── PLUGINS.md                     # how to author and operate plugins
+│   ├── AGENTS.md                   # how to author and operate agents
+│   └── PLUGINS.md                  # how to author and operate plugins
 ├── .github/workflows/
-│   ├── ci.yml                         # ruff + mypy + pytest (Linux)
-│   └── windows.yml                    # Pester (Windows runner)
-├── pyproject.toml
+│   ├── ci.yml                      # ruff + mypy + pytest (Linux)
+│   └── windows.yml                 # Pester (Windows runner)
 └── README.md
 ```
 
@@ -564,8 +579,8 @@ Adds a `device_app_overrides(device, app, exe_paths, process_names, urls)` table
 
 On-device agent implementations. Each is a new agent type — a published agent artifact + a bootstrap installer. The agent SDK handles polling, heartbeating, and self-update; the agent author writes the reconciler.
 
-- **`windows-agent`** (`curfew-agent-sdk-powershell`) — first agent; stress-tests the agent contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
-- **`macos-agent`** (`curfew_agent_sdk_python`) — same primitives translated for macOS.
+- **`windows-agent`** (`curfew-agent-sdk`) — first agent; stress-tests the agent contract. NTFS deny-execute on configured exe paths + Chrome/Edge `URLBlocklist` registry policy. Kills matching running processes.
+- **`macos-agent`** (`curfew_agent_sdk`) — same primitives translated for macOS.
 
 Future: `linux-agent`, embedded-device agents, etc.
 

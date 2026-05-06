@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "curfew-cli"
+version = "0.0.0"
+description = "curfew operator CLI — thin HTTP client of curfew-core"
+requires-python = ">=3.13"
+dependencies = ["curfew"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["curfew_cli"]
+
+[tool.uv.sources]
+curfew = { workspace = true }

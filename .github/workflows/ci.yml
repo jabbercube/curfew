@@ -13,7 +13,7 @@ jobs:
         with:
           enable-cache: true
       - name: Install Python and dependencies
-        run: uv sync --group dev
+        run: uv sync --all-packages --group dev
       - name: Ruff lint
         run: uv run ruff check .
       - name: Ruff format

@@ -157,8 +157,8 @@ Rules implement a single interface, declare their scope at registration, and ret
 
 Two language flavours sharing one contract:
 
-- `curfew_agent_sdk_python` — for `macos-agent` and any future Linux/macOS agent.
-- `curfew-agent-sdk-powershell` — for `windows-agent` and any future Windows agent.
+- `curfew_agent_sdk` — for `macos-agent` and any future Linux/macOS agent.
+- `curfew-agent-sdk` — for `windows-agent` and any future Windows agent.
 
 Both handle: polling loop, heartbeat dispatch with retry/backoff, hash-based change detection (ADR-012), versioned + hash-verified self-update (ADR-009), error reporting back to core, config bootstrap. An agent author writes the reconciler; the SDK handles the rest.
 
@@ -260,3 +260,40 @@ plugins/
 - **Python only.** Plugin authors who want a different language are out. For homelab plugins, Python is fine; if a use case for non-Python plugins ever shows up, the sidecar/HTTP shape can be added as an alternative without removing the drop-in shape.
 
 **Why this is a kernel commitment:** the plugin discovery model is part of the plugin contract. Operators install plugins by dropping folders into a `CURFEW_PLUGINS_DIRS` entry; plugin authors structure their code around `manifest.toml` + `plugin.py`. Changing this later means rewriting every plugin.
+
+## ADR-014: Per-component flat layout, not Python `src/`
+
+**Decided:** the repo is a per-component flat layout. Each top-level deliverable lives at its own root-level directory:
+
+- `core/` — shared library (models, schemas, rule pipeline, `Plugin` base class), package name `curfew`.
+- `api/` — FastAPI service, package name `curfew_api`. Owns its `Dockerfile` (the curfew-core image).
+- `cli/` — operator CLI, package name `curfew_cli`.
+- `agents/sdk-python/` — Python agent SDK, package name `curfew_agent_sdk`. Publishable.
+- `agents/sdk-powershell/` — PowerShell agent SDK module. Not a Python package.
+- `agents/<name>/` — concrete on-device agents (`windows-agent`, `macos-agent`, `reftest-agent`, …).
+- `plugins/<name>/` — drop-in in-core plugins (default `CURFEW_PLUGINS_DIRS` entry).
+- `e2e/` — cross-component integration tests.
+
+Each Python deliverable owns a `pyproject.toml`. The root `pyproject.toml` is a uv workspace (`[tool.uv.workspace] members = [...]`) that ties them into a single environment with one `uv.lock`. Tests live next to the code they test (`<component>/tests/`); cross-component integration lives in `e2e/`.
+
+**Rejected:**
+
+- **Single-pyproject Python `src/`-layout** (the just-scaffolded shape from PR #1). It's the conventional Python pattern but treats independent deliverables as one package. The PowerShell SDK has no natural home under `src/` (it's not Python). The reference-test consumers end up at `tests/reftest_*` even though they're production-shape consumers used *by* tests, not tests themselves. A single `Dockerfile` in `docker/` either pollutes the image with unrelated code or has to selectively COPY around what doesn't belong.
+- **Monorepo with one published package and internal sub-packages.** Hides that the agent SDKs are designed for third-party authors to install standalone. The shape we want is `pip install curfew-agent-sdk`, not `pip install curfew[agent-sdk]`.
+- **Separate `pyproject.toml` per directory but no workspace.** Loses the single lockfile and the "one `uv sync` does everything" UX. uv workspaces are the correct primitive.
+
+**Why this is a kernel commitment:**
+
+- Directory shape ships in the docs and is what plugin and agent authors anchor to. Renaming `agents/sdk-python/` after the SDK publishes means breaking external paths.
+- Per-image `Dockerfile`s and per-component `pyproject.toml`s shape the build pipeline. Changing layout post-hoc is a multi-day refactor; doing it pre-code is ~45 minutes.
+
+**Why now (not later):**
+
+- Zero functional code existed at the moment of decision (just scaffolding from PR #1 + #2). Cheapest possible moment.
+- The earlier audit-driven changes (uv adopted in PR #2; PEP 735 dependency groups; `default_install_hook_types: [pre-push]`) all assume a single workspace; this layout makes that workspace's structure honest.
+
+**Trade-offs accepted:**
+
+- Five `pyproject.toml` files instead of one. Cost dissolved by uv workspaces — `uv sync` reads them all; `uv.lock` is unified.
+- Cross-component imports must be declared explicitly (`api/pyproject.toml` lists `curfew` as a dep via `[tool.uv.sources] curfew = { workspace = true }`). This is correct, not friction — the dependency graph is now machine-readable.
+- The `curfew-core` Docker image's build context is the repo root, since uv reads the workspace metadata from there. The `Dockerfile` lives at `api/Dockerfile`; `docker/compose.yml` sets `context: ..` and `dockerfile: api/Dockerfile`.
