@@ -1,3 +1,16 @@
 {
-  "plansDirectory": ".claude/plans"
+  "plansDirectory": ".claude/plans",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR/.claude/plans\" 2>/dev/null || exit 0; d=$(date +%Y-%m-%d); for f in *.md; do [ -e \"$f\" ] || continue; case \"$f\" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*) ;; *) mv \"$f\" \"$d-$f\" ;; esac; done"
+          }
+        ]
+      }
+    ]
+  }
 }
