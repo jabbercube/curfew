@@ -56,7 +56,7 @@ iex (irm https://curfew.homelab.local/bootstrap/windows-agent?token=SECRET)
 
 That command:
 - Fetches `GET /v1/agents/windows-agent/manifest` → `{ version, sha256, url }`.
-- Downloads the agent artifact (a PowerShell script + the `curfew-agent-sdk-powershell` module bundled together) from `url`.
+- Downloads the agent artifact (a PowerShell script + the `curfew-agent-sdk` module bundled together) from `url`.
 - Verifies the SHA-256 matches what the manifest said.
 - Installs the files locally, drops `agent.config` (API URL, device name, bearer secret).
 - Registers a Windows Scheduled Task that runs the agent every minute.
@@ -89,11 +89,11 @@ This:
 
 ## What the agent author actually writes
 
-Most of the loop above is in the SDK (`curfew_agent_sdk_python` for Linux/macOS, `curfew-agent-sdk-powershell` for Windows). The author writes a **reconciler** — given the current lock status and config, do the right thing. Sketch:
+Most of the loop above is in the SDK (`curfew_agent_sdk` for Linux/macOS, `curfew-agent-sdk` for Windows). The author writes a **reconciler** — given the current lock status and config, do the right thing. Sketch:
 
 ```powershell
 # windows-agent/agent.ps1
-Import-Module curfew-agent-sdk-powershell
+Import-Module curfew-agent-sdk
 
 Register-Reconciler -ScriptBlock {
     param($state)
@@ -139,7 +139,7 @@ The bootstrap and update path are integrity-checked: `GET /v1/agents/{type}/mani
 
 Suppose you want a `linux-agent` agent. Steps:
 
-1. **Pick the SDK flavour.** Linux → `curfew_agent_sdk_python`. (Windows would use the PowerShell SDK; for anything else, Python.)
+1. **Pick the SDK flavour.** Linux → `curfew_agent_sdk`. (Windows would use the PowerShell SDK; for anything else, Python.)
 2. **Write the reconciler.** Subclass the SDK's agent class, implement `reconcile(state)`, do whatever Linux-specific blocking/killing you want (iptables to localhost, kill processes, deny execute via setfacl, etc.).
 3. **Build a bootstrap installer** — a small shell script that the operator runs on the target machine. It fetches the manifest, verifies hash, installs, registers a systemd timer (or cron, or whatever).
 4. **Publish a version.** `curfew agent publish linux-agent 1.0.0 ./linux-agent.tar` ships the artifact + hash to curfew-core. From now on, `curfew agent install linux-agent <device>` will work.

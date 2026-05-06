@@ -1,14 +1,14 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
-name = "curfew"
+name = "curfew-workspace"
 version = "0.0.0"
-description = "Modular, extensible tool for managing screentime across the household"
-readme = "README.md"
+description = "curfew workspace root — see core/, api/, cli/, agents/sdk-python/ for the deliverables"
 requires-python = ">=3.13"
-dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["core", "api", "cli", "agents/sdk-python"]
 
 [dependency-groups]
 dev = [
@@ -18,19 +18,9 @@ dev = [
     "pre-commit>=3.7",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = [
-    "src/curfew",
-    "src/curfew_api",
-    "src/curfew_cli",
-    "src/curfew_agent_sdk_python",
-]
-
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["src", "tests"]
-exclude = ["src/curfew-agent-sdk-powershell"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "N", "RUF"]
@@ -38,9 +28,13 @@ select = ["E", "F", "W", "I", "B", "UP", "N", "RUF"]
 [tool.mypy]
 python_version = "3.13"
 strict = true
-mypy_path = "src"
-explicit_package_bases = true
 packages = ["curfew", "curfew_api"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = [
+    "core/tests",
+    "api/tests",
+    "cli/tests",
+    "agents/sdk-python/tests",
+]
+addopts = "--import-mode=importlib"

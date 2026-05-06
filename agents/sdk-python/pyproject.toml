@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "curfew-agent-sdk"
+version = "0.0.0"
+description = "Python agent SDK: polling loop, heartbeat, hash-based change detection, self-update"
+requires-python = ">=3.13"
+dependencies = ["curfew"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["curfew_agent_sdk"]
+
+[tool.uv.sources]
+curfew = { workspace = true }
