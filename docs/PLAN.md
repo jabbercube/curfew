@@ -399,8 +399,8 @@ Settings
   GET    /v1/settings                           read all runtime-mutable settings
   PATCH  /v1/settings                           update one or more (audited)
 
-Admin
-  GET    /v1/admin/snapshot                     full system snapshot (debug; not the primary read path)
+System
+  GET    /v1/system/snapshot                    full system snapshot (debug; not the primary read path)
   GET    /v1/health                             liveness probe
 ```
 
