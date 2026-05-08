@@ -16,3 +16,4 @@ In the planning stage.
 - [docs/DECISIONS.md](docs/DECISIONS.md) — design decisions and rejected alternatives (ADRs).
 - [docs/AGENTS.md](docs/AGENTS.md) — how on-device agents work and how to write one.
 - [docs/PLUGINS.md](docs/PLUGINS.md) — how in-core plugins work and how to write one.
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — local dev setup, devcontainer, and `just` recipes.
