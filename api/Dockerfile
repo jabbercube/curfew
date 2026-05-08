@@ -10,6 +10,11 @@ COPY api ./api
 COPY cli ./cli
 COPY agents ./agents
 
+# SPA bundle (built with `just web-build` outside the container, before
+# `docker build`). Optional — if `web/dist` is missing, FastAPI's static
+# mount is a no-op (check_dir=False) and the API still serves /v1/*.
+COPY web/dist ./web/dist
+
 RUN uv sync --frozen --no-dev --package curfew-api
 
 EXPOSE 8000
