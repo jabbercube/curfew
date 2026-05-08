@@ -2,7 +2,7 @@
 
 Revision ID: 0001
 Revises:
-Create Date: 2026-05-05
+Create Date: 2026-05-08
 
 Creates the 10 kernel tables and seeds the singleton settings row.
 """
@@ -22,12 +22,16 @@ depends_on: str | Sequence[str] | None = None
 def upgrade() -> None:
     op.create_table(
         "apps",
+        sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("slug", sa.String(), nullable=False),
         sa.Column("exe_paths", sa.JSON(), nullable=False),
         sa.Column("process_names", sa.JSON(), nullable=False),
         sa.Column("urls", sa.JSON(), nullable=False),
-        sa.PrimaryKeyConstraint("slug", name=op.f("pk_apps")),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_apps")),
     )
+    with op.batch_alter_table("apps", schema=None) as batch_op:
+        batch_op.create_index(batch_op.f("ix_apps_slug"), ["slug"], unique=True)
+
     op.create_table(
         "audit_log",
         sa.Column("id", sa.Integer(), nullable=False),
@@ -91,19 +95,24 @@ def upgrade() -> None:
     )
     op.create_table(
         "users",
-        sa.Column("slug", sa.String(), nullable=False),
+        sa.Column("id", sa.Integer(), nullable=False),
+        sa.Column("username", sa.String(), nullable=False),
         sa.Column(
             "role",
             sa.Enum("MEMBER", "MANAGER", "ADMIN", name="userrole", native_enum=False),
             nullable=False,
         ),
         sa.Column("managed", sa.Boolean(), nullable=False),
-        sa.PrimaryKeyConstraint("slug", name=op.f("pk_users")),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_users")),
     )
+    with op.batch_alter_table("users", schema=None) as batch_op:
+        batch_op.create_index(batch_op.f("ix_users_username"), ["username"], unique=True)
+
     op.create_table(
         "devices",
+        sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("slug", sa.String(), nullable=False),
-        sa.Column("owner", sa.String(), nullable=True),
+        sa.Column("owner_id", sa.Integer(), nullable=True),
         sa.Column(
             "type",
             sa.Enum("PC", "PHONE", "TABLET", "CONSOLE", "TV", name="devicetype", native_enum=False),
@@ -124,47 +133,52 @@ def upgrade() -> None:
         ),
         sa.Column("mac", sa.JSON(), nullable=False),
         sa.Column("managed", sa.Boolean(), nullable=False),
-        sa.ForeignKeyConstraint(["owner"], ["users.slug"], name=op.f("fk_devices_owner_users")),
-        sa.PrimaryKeyConstraint("slug", name=op.f("pk_devices")),
+        sa.ForeignKeyConstraint(["owner_id"], ["users.id"], name=op.f("fk_devices_owner_id_users")),
+        sa.PrimaryKeyConstraint("id", name=op.f("pk_devices")),
     )
+    with op.batch_alter_table("devices", schema=None) as batch_op:
+        batch_op.create_index(batch_op.f("ix_devices_slug"), ["slug"], unique=True)
+
     op.create_table(
         "user_locks",
-        sa.Column("user", sa.String(), nullable=False),
+        sa.Column("user_id", sa.Integer(), nullable=False),
         sa.Column("manual_lock", sa.Boolean(), nullable=False),
         sa.Column("set_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("set_by", sa.String(), nullable=True),
-        sa.ForeignKeyConstraint(["user"], ["users.slug"], name=op.f("fk_user_locks_user_users")),
-        sa.PrimaryKeyConstraint("user", name=op.f("pk_user_locks")),
+        sa.ForeignKeyConstraint(
+            ["user_id"], ["users.id"], name=op.f("fk_user_locks_user_id_users")
+        ),
+        sa.PrimaryKeyConstraint("user_id", name=op.f("pk_user_locks")),
     )
     op.create_table(
         "agent_tokens",
-        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("id", sa.Integer(), nullable=False),
         sa.Column("token_hash", sa.String(), nullable=False),
-        sa.Column("device", sa.String(), nullable=False),
+        sa.Column("device_id", sa.Integer(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
         sa.ForeignKeyConstraint(
-            ["device"], ["devices.slug"], name=op.f("fk_agent_tokens_device_devices")
+            ["device_id"], ["devices.id"], name=op.f("fk_agent_tokens_device_id_devices")
         ),
         sa.PrimaryKeyConstraint("id", name=op.f("pk_agent_tokens")),
         sa.UniqueConstraint("token_hash", name=op.f("uq_agent_tokens_token_hash")),
     )
     with op.batch_alter_table("agent_tokens", schema=None) as batch_op:
         batch_op.create_index(
-            "ix_agent_tokens_device_revoked_at", ["device", "revoked_at"], unique=False
+            "ix_agent_tokens_device_id_revoked_at", ["device_id", "revoked_at"], unique=False
         )
 
     op.create_table(
         "agents",
-        sa.Column("device", sa.String(), nullable=False),
+        sa.Column("device_id", sa.Integer(), nullable=False),
         sa.Column("type", sa.String(), nullable=False),
         sa.Column("config", sa.JSON(), nullable=False),
         sa.Column("last_heartbeat", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_seen_version", sa.String(), nullable=True),
         sa.ForeignKeyConstraint(
-            ["device"], ["devices.slug"], name=op.f("fk_agents_device_devices")
+            ["device_id"], ["devices.id"], name=op.f("fk_agents_device_id_devices")
         ),
-        sa.PrimaryKeyConstraint("device", name=op.f("pk_agents")),
+        sa.PrimaryKeyConstraint("device_id", name=op.f("pk_agents")),
     )
 
     # Seed the singleton settings row with documented defaults.
@@ -182,10 +196,14 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("agents")
     with op.batch_alter_table("agent_tokens", schema=None) as batch_op:
-        batch_op.drop_index("ix_agent_tokens_device_revoked_at")
+        batch_op.drop_index("ix_agent_tokens_device_id_revoked_at")
     op.drop_table("agent_tokens")
     op.drop_table("user_locks")
+    with op.batch_alter_table("devices", schema=None) as batch_op:
+        batch_op.drop_index(batch_op.f("ix_devices_slug"))
     op.drop_table("devices")
+    with op.batch_alter_table("users", schema=None) as batch_op:
+        batch_op.drop_index(batch_op.f("ix_users_username"))
     op.drop_table("users")
     op.drop_table("settings")
     op.drop_table("plugins")
@@ -194,4 +212,6 @@ def downgrade() -> None:
         batch_op.drop_index("ix_audit_log_target_kind_target_id")
         batch_op.drop_index("ix_audit_log_occurred_at")
     op.drop_table("audit_log")
+    with op.batch_alter_table("apps", schema=None) as batch_op:
+        batch_op.drop_index(batch_op.f("ix_apps_slug"))
     op.drop_table("apps")

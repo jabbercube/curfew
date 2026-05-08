@@ -297,3 +297,29 @@ Each Python deliverable owns a `pyproject.toml`. The root `pyproject.toml` is a 
 - Five `pyproject.toml` files instead of one. Cost dissolved by uv workspaces — `uv sync` reads them all; `uv.lock` is unified.
 - Cross-component imports must be declared explicitly (`api/pyproject.toml` lists `curfew` as a dep via `[tool.uv.sources] curfew = { workspace = true }`). This is correct, not friction — the dependency graph is now machine-readable.
 - The `curfew-core` Docker image's build context is the repo root, since uv reads the workspace metadata from there. The `Dockerfile` lives at `api/Dockerfile`; `docker/compose.yml` sets `context: ..` and `dockerfile: api/Dockerfile`.
+
+## ADR-015: Surrogate INTEGER PKs + UNIQUE handle columns
+
+**Decided:** every kernel table uses `id INTEGER PRIMARY KEY AUTOINCREMENT` as its primary key. The user-facing handle (`username` on `users`, `slug` on `devices` and `apps`, `token_hash` on `agent_tokens`) is a UNIQUE NOT NULL indexed column, not the PK. Foreign keys reference `id`, not the handle. Three small tables stay PK-on-natural-key for shape reasons: `plugins` (composite `(type, instance_id)`), `manifests` (`type` is the natural key — one row per agent type), `settings` (`id` with CHECK `id = 1` for the singleton).
+
+**Rejected:**
+
+- **UUID PKs (v4 or v7).** UUIDs are good for: client-side ID generation, distributed inserts that need to merge later, sharded databases, multi-master replication, hiding row counts from public APIs. curfew is one SQLite file in one container — none of those apply. Worse, UUID gives up SQLite's `INTEGER PRIMARY KEY` rowid alias, the engine's most efficient PK shape (lookups skip an indirection any other PK type pays). At homelab scale the perf delta is small in absolute terms but it's a steady cost paid on every query for no concrete gain. If a future feature ever involves merging databases, the standard fix is adding a single `external_id UUID UNIQUE` column to the affected tables — not retroactively changing every PK.
+- **Slug-as-PK** (the shape PR #5 originally landed with — `users.slug`, `devices.slug`, `apps.slug` as PKs). Less typical in production Python apps and creates rename-cascade pain: if a user's CLI handle ever changes (`kid1` → `alice`), every FK column in the system has to update or break. SQLite supports `ON UPDATE CASCADE`, but the audit log values aren't FKs and would need a manual `UPDATE`. With surrogate IDs, the rename is one row's `username` column. One column doing two jobs (identity + display) also collapses harder when display-name requirements grow.
+
+**Why now:**
+
+- Pre-prod. PR #5 had merged but no operator had deployed against the schema, so the change is a rewrite of `0001_initial.py` rather than a `0002_*` ALTER migration. Once a release ships somewhere real, the "never edit released migrations" rule kicks in.
+- The earlier `name → slug` rename in PR #5 was a stepping stone — recognising the column was a slug, not a display name. This step finishes the move: `slug` (and the user-table-specific `username`) becomes a UNIQUE attribute, not the PK.
+
+**Trade-offs accepted:**
+
+- One extra column per table — negligible.
+- Test code creates parent rows, calls `session.flush()`, then references `parent.id` for child FKs. A small ergonomic cost vs. slug-as-PK's `device.owner = "kid1"`. SQLModel `relationship()` declarations would smooth this; deferred until CRUD lands and access patterns are visible.
+- API URL paths (`/v1/users/{user}/...`) still take the human handle as the path parameter. That means one `WHERE username = ?` lookup at request entry, then `id`-based JOINs internally. The double hop is real but trivial at this scale, and the URL ergonomics are worth more than one indexed lookup per request.
+
+**Why this is a kernel commitment:**
+
+- Every later kernel slice (auth middleware, rule pipeline, every CRUD endpoint, agent state hash, plugin discovery, audit log writes) writes against this schema. Changing PK shape after CRUD lands is a multi-day refactor across every endpoint, every test, every migration. Doing it now is one commit.
+- The PK shape ships in the OpenAPI types. Renaming `users.slug` to `users.username` after the API stabilises means breaking external clients (CLI, future GUI, future SDK consumers).
+

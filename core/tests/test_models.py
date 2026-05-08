@@ -51,12 +51,21 @@ def session(tmp_path) -> Iterator[Session]:
 
 
 def test_user_round_trip(session: Session) -> None:
-    session.add(User(slug="kid1", role=UserRole.MEMBER, managed=True))
+    session.add(User(username="kid1", role=UserRole.MEMBER, managed=True))
     session.commit()
-    got = session.exec(select(User).where(User.slug == "kid1")).one()
-    assert got.slug == "kid1"
+    got = session.exec(select(User).where(User.username == "kid1")).one()
+    assert got.id is not None
+    assert got.username == "kid1"
     assert got.role is UserRole.MEMBER
     assert got.managed is True
+
+
+def test_username_unique(session: Session) -> None:
+    session.add(User(username="kid1", role=UserRole.MEMBER))
+    session.commit()
+    session.add(User(username="kid1", role=UserRole.MEMBER))
+    with pytest.raises(IntegrityError):
+        session.commit()
 
 
 def test_app_json_columns(session: Session) -> None:
@@ -70,17 +79,19 @@ def test_app_json_columns(session: Session) -> None:
     )
     session.commit()
     got = session.exec(select(App).where(App.slug == "steam")).one()
+    assert got.id is not None
     assert got.exe_paths == ["C:/Steam/steam.exe"]
     assert got.urls == ["https://store.steampowered.com"]
 
 
 def test_device_fk_to_user(session: Session) -> None:
-    session.add(User(slug="kid1", role=UserRole.MEMBER))
-    session.flush()  # parent must exist before child INSERT under PRAGMA foreign_keys=ON
+    user = User(username="kid1", role=UserRole.MEMBER)
+    session.add(user)
+    session.flush()
     session.add(
         Device(
             slug="gamingrig",
-            owner="kid1",
+            owner_id=user.id,
             type=DeviceType.PC,
             os=DeviceOS.WINDOWS,
             mac=["aa:bb:cc:dd:ee:ff"],
@@ -88,49 +99,56 @@ def test_device_fk_to_user(session: Session) -> None:
     )
     session.commit()
     got = session.exec(select(Device).where(Device.slug == "gamingrig")).one()
-    assert got.owner == "kid1"
+    assert got.owner_id == user.id
     assert got.type is DeviceType.PC
 
 
 def test_device_owner_nullable_for_shared(session: Session) -> None:
-    session.add(Device(slug="livingroomtv", owner=None, type=DeviceType.TV, os=DeviceOS.ANDROID))
+    session.add(Device(slug="livingroomtv", owner_id=None, type=DeviceType.TV, os=DeviceOS.ANDROID))
     session.commit()
     got = session.exec(select(Device).where(Device.slug == "livingroomtv")).one()
-    assert got.owner is None
+    assert got.owner_id is None
 
 
 def test_device_fk_violation_rejects_unknown_owner(session: Session) -> None:
-    session.add(Device(slug="d1", owner="ghost", type=DeviceType.PC, os=DeviceOS.WINDOWS))
+    session.add(Device(slug="d1", owner_id=999, type=DeviceType.PC, os=DeviceOS.WINDOWS))
     with pytest.raises(IntegrityError):
         session.commit()
 
 
 def test_agent_one_per_device(session: Session) -> None:
-    session.add(User(slug="kid1", role=UserRole.MEMBER))
+    user = User(username="kid1", role=UserRole.MEMBER)
+    session.add(user)
     session.flush()
-    session.add(Device(slug="rig", owner="kid1", type=DeviceType.PC, os=DeviceOS.WINDOWS))
+    device = Device(slug="rig", owner_id=user.id, type=DeviceType.PC, os=DeviceOS.WINDOWS)
+    session.add(device)
     session.flush()
-    session.add(Agent(device="rig", type="windows-agent", config={"windows_user": "Kid1Local"}))
+    session.add(
+        Agent(device_id=device.id, type="windows-agent", config={"windows_user": "Kid1Local"})
+    )
     session.commit()
 
     # Trying to add a second agent for the same device violates PK.
-    session.add(Agent(device="rig", type="other-agent", config={}))
+    session.add(Agent(device_id=device.id, type="other-agent", config={}))
     with pytest.raises(IntegrityError):
         session.commit()
 
 
-def test_agent_token_uuid_pk_and_unique_hash(session: Session) -> None:
-    session.add(User(slug="kid1", role=UserRole.MEMBER))
+def test_agent_token_unique_hash(session: Session) -> None:
+    user = User(username="kid1", role=UserRole.MEMBER)
+    session.add(user)
     session.flush()
-    session.add(Device(slug="rig", owner="kid1", type=DeviceType.PC, os=DeviceOS.WINDOWS))
+    device = Device(slug="rig", owner_id=user.id, type=DeviceType.PC, os=DeviceOS.WINDOWS)
+    session.add(device)
     session.flush()
-    t1 = AgentToken(token_hash="hash-a", device="rig")
-    t2 = AgentToken(token_hash="hash-b", device="rig")
+    t1 = AgentToken(token_hash="hash-a", device_id=device.id)
+    t2 = AgentToken(token_hash="hash-b", device_id=device.id)
     session.add_all([t1, t2])
     session.commit()
+    assert t1.id is not None and t2.id is not None and t1.id != t2.id
 
     # Second token with the same hash violates UNIQUE.
-    session.add(AgentToken(token_hash="hash-a", device="rig"))
+    session.add(AgentToken(token_hash="hash-a", device_id=device.id))
     with pytest.raises(IntegrityError):
         session.commit()
 
@@ -150,13 +168,14 @@ def test_plugin_composite_pk(session: Session) -> None:
 
 
 def test_user_lock_default_unset(session: Session) -> None:
-    session.add(User(slug="kid1", role=UserRole.MEMBER))
+    user = User(username="kid1", role=UserRole.MEMBER)
+    session.add(user)
     session.flush()
-    session.add(UserLock(user="kid1"))
+    session.add(UserLock(user_id=user.id))
     session.commit()
-    got = session.exec(select(UserLock).where(UserLock.user == "kid1")).one()
+    got = session.exec(select(UserLock).where(UserLock.user_id == user.id)).one()
     assert got.manual_lock is False
-    assert got.set_at.tzinfo is not None  # timezone-aware
+    assert got.set_at.tzinfo is not None
 
 
 def test_audit_log_target_kind_enum(session: Session) -> None:
@@ -185,10 +204,8 @@ def test_manifest_round_trip(session: Session) -> None:
 
 
 def test_settings_singleton_check(session: Session) -> None:
-    # The migration seeds row id=1; in this test (create_all path) we insert it ourselves.
     session.add(Settings(id=1))
     session.commit()
-    # Inserting any other id is rejected by the CHECK constraint.
     session.add(Settings(id=2))
     with pytest.raises(IntegrityError):
         session.commit()
@@ -206,21 +223,23 @@ def test_settings_defaults(session: Session) -> None:
 
 
 def test_datetime_round_trip_is_utc(session: Session) -> None:
-    session.add(User(slug="kid1", role=UserRole.MEMBER))
+    user = User(username="kid1", role=UserRole.MEMBER)
+    session.add(user)
     session.flush()
     when = datetime(2026, 5, 5, 12, 0, tzinfo=UTC)
-    session.add(UserLock(user="kid1", manual_lock=True, set_at=when))
+    session.add(UserLock(user_id=user.id, manual_lock=True, set_at=when))
     session.commit()
     got = session.exec(select(UserLock)).one()
     assert got.set_at == when
-    assert got.set_at.tzinfo is not None  # UTCDateTime guarantees this
+    assert got.set_at.tzinfo is not None
 
 
 def test_naive_datetime_rejected(session: Session) -> None:
     from sqlalchemy.exc import StatementError
 
-    session.add(User(slug="kid1", role=UserRole.MEMBER))
+    user = User(username="kid1", role=UserRole.MEMBER)
+    session.add(user)
     session.flush()
-    session.add(UserLock(user="kid1", set_at=datetime(2026, 5, 5, 12, 0)))
+    session.add(UserLock(user_id=user.id, set_at=datetime(2026, 5, 5, 12, 0)))
     with pytest.raises(StatementError, match="naive datetime rejected"):
         session.commit()

@@ -1,8 +1,9 @@
 """Kernel storage models for curfew.
 
-All 10 tables defined per docs/PLAN.md §"Tables", with the schema deviations
-documented in the storage-kernel PR. Adding a new feature usually means adding a
-new table or columns; the existing tables are stable contracts.
+All 10 tables defined per docs/PLAN.md §"Tables". Each row has a surrogate
+INTEGER PK (`id`); user-facing handles (slug, username, token_hash) are
+demoted to UNIQUE NOT NULL indexed columns. Adding a new feature usually
+means adding a new table or columns; the existing tables are stable contracts.
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
-from uuid import UUID, uuid4
 
 from sqlalchemy import (
     JSON,
@@ -122,7 +122,8 @@ def _utcnow() -> datetime:
 class User(SQLModel, table=True):
     __tablename__ = "users"
 
-    slug: str = Field(primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
+    username: str = Field(unique=True, index=True)
     role: UserRole = Field(sa_column=Column(SAEnum(UserRole, native_enum=False), nullable=False))
     managed: bool = Field(default=True)
 
@@ -130,7 +131,8 @@ class User(SQLModel, table=True):
 class App(SQLModel, table=True):
     __tablename__ = "apps"
 
-    slug: str = Field(primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
+    slug: str = Field(unique=True, index=True)
     exe_paths: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
     process_names: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
     urls: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
@@ -139,8 +141,9 @@ class App(SQLModel, table=True):
 class Device(SQLModel, table=True):
     __tablename__ = "devices"
 
-    slug: str = Field(primary_key=True)
-    owner: str | None = Field(default=None, foreign_key="users.slug")
+    id: int | None = Field(default=None, primary_key=True)
+    slug: str = Field(unique=True, index=True)
+    owner_id: int | None = Field(default=None, foreign_key="users.id")
     type: DeviceType = Field(
         sa_column=Column(SAEnum(DeviceType, native_enum=False), nullable=False)
     )
@@ -152,7 +155,7 @@ class Device(SQLModel, table=True):
 class Agent(SQLModel, table=True):
     __tablename__ = "agents"
 
-    device: str = Field(primary_key=True, foreign_key="devices.slug")
+    device_id: int | None = Field(default=None, primary_key=True, foreign_key="devices.id")
     type: str
     config: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     last_heartbeat: datetime | None = Field(default=None, sa_column=Column(UTCDateTime))
@@ -163,12 +166,12 @@ class AgentToken(SQLModel, table=True):
     __tablename__ = "agent_tokens"
     __table_args__ = (
         UniqueConstraint("token_hash"),
-        Index("ix_agent_tokens_device_revoked_at", "device", "revoked_at"),
+        Index("ix_agent_tokens_device_id_revoked_at", "device_id", "revoked_at"),
     )
 
-    id: UUID = Field(default_factory=uuid4, primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
     token_hash: str
-    device: str = Field(foreign_key="devices.slug")
+    device_id: int = Field(foreign_key="devices.id")
     created_at: datetime = Field(
         default_factory=_utcnow, sa_column=Column(UTCDateTime, nullable=False)
     )
@@ -188,7 +191,7 @@ class Plugin(SQLModel, table=True):
 class UserLock(SQLModel, table=True):
     __tablename__ = "user_locks"
 
-    user: str = Field(primary_key=True, foreign_key="users.slug")
+    user_id: int | None = Field(default=None, primary_key=True, foreign_key="users.id")
     manual_lock: bool = Field(default=False)
     set_at: datetime = Field(default_factory=_utcnow, sa_column=Column(UTCDateTime, nullable=False))
     set_by: str | None = None
