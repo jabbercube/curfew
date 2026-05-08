@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from curfew_api.auth import Operator
+from curfew_api.auth import Operator, RequireAdmin
 
 router = APIRouter(prefix="/v1/devices", tags=["devices"])
 
@@ -55,7 +55,7 @@ def list_devices(
 @router.post("", response_model=DeviceRead, status_code=status.HTTP_201_CREATED)
 def create_device(
     payload: DeviceCreate,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> Device:
     _validate_owner_id(session, payload.owner_id)
@@ -107,7 +107,7 @@ def get_device(
 def update_device(
     device: str,
     payload: DeviceUpdate,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> Device:
     row = _get_device_or_404(session, device)
@@ -147,7 +147,7 @@ def update_device(
 @router.delete("/{device}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_device(
     device: str,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> None:
     row = _get_device_or_404(session, device)

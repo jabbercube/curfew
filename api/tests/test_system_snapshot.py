@@ -44,8 +44,10 @@ def test_empty_snapshot_has_all_top_level_keys(client: TestClient, auth: dict[st
 
 
 def test_snapshot_includes_users_devices_apps(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
-    user_id = client.post("/v1/users", json={"username": "kid2"}, headers=auth).json()["id"]
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
+    user_id = client.post(
+        "/v1/users", json={"username": "kid2", "password": "test1234"}, headers=auth
+    ).json()["id"]
     client.post(
         "/v1/devices",
         json={"slug": "rig", "type": "pc", "os": "windows", "owner_id": user_id},
@@ -61,7 +63,9 @@ def test_snapshot_includes_users_devices_apps(client: TestClient, auth: dict[str
 
 
 def test_snapshot_includes_user_lock_after_lock(client: TestClient, auth: dict[str, str]) -> None:
-    user_id = client.post("/v1/users", json={"username": "kid1"}, headers=auth).json()["id"]
+    user_id = client.post(
+        "/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth
+    ).json()["id"]
     client.post("/v1/users/kid1/lock", headers=auth)
 
     body = client.get("/v1/system/snapshot", headers=auth).json()
@@ -97,7 +101,7 @@ def test_audit_log_count_increases_with_writes(client: TestClient, auth: dict[st
     initial = client.get("/v1/system/snapshot", headers=auth).json()["counts"]["audit_log"]
     assert initial == 0
 
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     client.patch("/v1/settings", json={"agent_tick_seconds": 30}, headers=auth)
 
     body = client.get("/v1/system/snapshot", headers=auth).json()

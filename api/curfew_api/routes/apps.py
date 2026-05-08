@@ -19,7 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from curfew_api.auth import Operator
+from curfew_api.auth import Operator, RequireAdmin
 
 router = APIRouter(prefix="/v1/apps", tags=["apps"])
 
@@ -42,7 +42,7 @@ def list_apps(
 @router.post("", response_model=AppRead, status_code=status.HTTP_201_CREATED)
 def create_app(
     payload: AppCreate,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> App:
     app = App(
@@ -90,7 +90,7 @@ def get_app(
 def update_app(
     app: str,
     payload: AppUpdate,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> App:
     row = _get_app_or_404(session, app)
@@ -127,7 +127,7 @@ def update_app(
 @router.delete("/{app}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_app(
     app: str,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> None:
     row = _get_app_or_404(session, app)

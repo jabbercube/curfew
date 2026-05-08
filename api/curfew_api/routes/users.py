@@ -7,12 +7,13 @@ from typing import Annotated
 from curfew.audit import record_audit
 from curfew.db import get_session
 from curfew.models import AuditTargetKind, Device, User, UserLock
+from curfew.passwords import hash_password
 from curfew.schemas import UserCreate, UserRead, UserUpdate
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
-from curfew_api.auth import Operator
+from curfew_api.auth import Operator, RequireAdmin
 
 router = APIRouter(prefix="/v1/users", tags=["users"])
 
@@ -35,10 +36,15 @@ def list_users(
 @router.post("", response_model=UserRead, status_code=status.HTTP_201_CREATED)
 def create_user(
     payload: UserCreate,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> User:
-    user = User(username=payload.username, role=payload.role, managed=payload.managed)
+    user = User(
+        username=payload.username,
+        role=payload.role,
+        managed=payload.managed,
+        password_hash=hash_password(payload.password),
+    )
     session.add(user)
     try:
         session.flush()
@@ -74,7 +80,7 @@ def get_user(
 def update_user(
     user: str,
     payload: UserUpdate,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> User:
     row = _get_user_or_404(session, user)
@@ -111,7 +117,7 @@ def update_user(
 @router.delete("/{user}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_user(
     user: str,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> None:
     row = _get_user_or_404(session, user)

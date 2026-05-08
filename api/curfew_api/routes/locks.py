@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 from curfew.audit import record_audit
+from curfew.auth import Actor
 from curfew.db import get_session
 from curfew.models import AuditTargetKind, User, UserLock
 from curfew.rules import user_scope
@@ -18,12 +19,12 @@ from curfew.schemas import LockStatus
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session, select
 
-from curfew_api.auth import Operator
+from curfew_api.auth import RequireManager
 
 router = APIRouter(prefix="/v1/users", tags=["locks"])
 
 
-def _set_manual_lock(session: Session, *, username: str, locked: bool, actor: str) -> LockStatus:
+def _set_manual_lock(session: Session, *, username: str, locked: bool, actor: Actor) -> LockStatus:
     user = session.exec(select(User).where(User.username == username)).first()
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="user not found")
@@ -34,13 +35,13 @@ def _set_manual_lock(session: Session, *, username: str, locked: bool, actor: st
             user_id=user.id,
             manual_lock=locked,
             set_at=datetime.now(UTC),
-            set_by=actor,
+            set_by=actor.audit_str,
         )
         session.add(lock)
     else:
         lock.manual_lock = locked
         lock.set_at = datetime.now(UTC)
-        lock.set_by = actor
+        lock.set_by = actor.audit_str
         session.add(lock)
     session.flush()
 
@@ -60,7 +61,7 @@ def _set_manual_lock(session: Session, *, username: str, locked: bool, actor: st
 @router.post("/{user}/lock", response_model=LockStatus)
 def lock_user(
     user: str,
-    actor: Operator,
+    actor: RequireManager,
     session: Annotated[Session, Depends(get_session)],
 ) -> LockStatus:
     return _set_manual_lock(session, username=user, locked=True, actor=actor)
@@ -69,7 +70,7 @@ def lock_user(
 @router.post("/{user}/unlock", response_model=LockStatus)
 def unlock_user(
     user: str,
-    actor: Operator,
+    actor: RequireManager,
     session: Annotated[Session, Depends(get_session)],
 ) -> LockStatus:
     return _set_manual_lock(session, username=user, locked=False, actor=actor)

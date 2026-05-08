@@ -55,3 +55,41 @@ def client(configured_db: Path) -> TestClient:
 @pytest.fixture
 def auth() -> dict[str, str]:
     return {"Authorization": "Bearer test-token"}
+
+
+# --- Role-typed user clients -------------------------------------------------
+#
+# Each fixture creates a user with the given role (using the root token), logs
+# them in via /v1/auth/login, and yields a TestClient that already carries the
+# session cookie for that user. Tests for role gating use these to assert that
+# e.g. a manager cannot hit an admin-only endpoint.
+
+
+def _login_as(client: TestClient, auth: dict[str, str], username: str, role: str) -> TestClient:
+    """Create a user with the given role + log them in; return a cookie-bearing client."""
+    r = client.post(
+        "/v1/users",
+        json={"username": username, "password": "test1234", "role": role},
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    r = client.post("/v1/auth/login", json={"username": username, "password": "test1234"})
+    assert r.status_code == 204, r.text
+    # TestClient persists cookies on the same instance, so the same client is now
+    # authenticated as `username`.
+    return client
+
+
+@pytest.fixture
+def admin_client(client: TestClient, auth: dict[str, str]) -> TestClient:
+    return _login_as(client, auth, "admin1", "admin")
+
+
+@pytest.fixture
+def manager_client(client: TestClient, auth: dict[str, str]) -> TestClient:
+    return _login_as(client, auth, "manager1", "manager")
+
+
+@pytest.fixture
+def member_client(client: TestClient, auth: dict[str, str]) -> TestClient:
+    return _login_as(client, auth, "member1", "member")

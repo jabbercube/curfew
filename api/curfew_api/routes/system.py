@@ -49,14 +49,14 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from curfew_api.auth import Operator
+from curfew_api.auth import RequireAdmin
 
 router = APIRouter(prefix="/v1/system", tags=["system"])
 
 
 @router.get("/snapshot", response_model=SystemSnapshot)
 def get_snapshot(
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> SystemSnapshot:
     settings_row = session.exec(select(Settings)).one()

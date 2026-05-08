@@ -24,7 +24,7 @@ def test_list_empty(client: TestClient, auth: dict[str, str]) -> None:
 
 def test_list_alphabetical(client: TestClient, auth: dict[str, str]) -> None:
     for username in ["zoe", "alice", "kid1"]:
-        client.post("/v1/users", json={"username": username}, headers=auth)
+        client.post("/v1/users", json={"username": username, "password": "test1234"}, headers=auth)
     r = client.get("/v1/users", headers=auth)
     assert [u["username"] for u in r.json()] == ["alice", "kid1", "zoe"]
 
@@ -37,7 +37,7 @@ def test_list_unauthenticated(client: TestClient) -> None:
 
 
 def test_patch_role_only(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     r = client.patch("/v1/users/kid1", json={"role": "manager"}, headers=auth)
     assert r.status_code == 200
     body = r.json()
@@ -47,13 +47,13 @@ def test_patch_role_only(client: TestClient, auth: dict[str, str]) -> None:
 
 
 def test_patch_managed_flag(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     r = client.patch("/v1/users/kid1", json={"managed": False}, headers=auth)
     assert r.json()["managed"] is False
 
 
 def test_patch_username_rename(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     r = client.patch("/v1/users/kid1", json={"username": "alice"}, headers=auth)
     assert r.status_code == 200
     assert r.json()["username"] == "alice"
@@ -63,15 +63,15 @@ def test_patch_username_rename(client: TestClient, auth: dict[str, str]) -> None
 
 
 def test_patch_empty_body_is_noop(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     r = client.patch("/v1/users/kid1", json={}, headers=auth)
     assert r.status_code == 200
     assert r.json()["username"] == "kid1"
 
 
 def test_patch_username_collision_409(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
-    client.post("/v1/users", json={"username": "kid2"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid2", "password": "test1234"}, headers=auth)
     r = client.patch("/v1/users/kid1", json={"username": "kid2"}, headers=auth)
     assert r.status_code == 409
 
@@ -82,7 +82,7 @@ def test_patch_missing_user_404(client: TestClient, auth: dict[str, str]) -> Non
 
 
 def test_patch_unauthenticated(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     assert client.patch("/v1/users/kid1", json={"role": "admin"}).status_code == 401
 
 
@@ -90,7 +90,7 @@ def test_patch_unauthenticated(client: TestClient, auth: dict[str, str]) -> None
 
 
 def test_delete_returns_204(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     r = client.delete("/v1/users/kid1", headers=auth)
     assert r.status_code == 204
     assert client.get("/v1/users/kid1", headers=auth).status_code == 404
@@ -101,7 +101,9 @@ def test_delete_missing_user_404(client: TestClient, auth: dict[str, str]) -> No
 
 
 def test_delete_user_with_devices_409(client: TestClient, auth: dict[str, str]) -> None:
-    user_id = client.post("/v1/users", json={"username": "kid1"}, headers=auth).json()["id"]
+    user_id = client.post(
+        "/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth
+    ).json()["id"]
     client.post(
         "/v1/devices",
         json={"slug": "rig", "type": "pc", "os": "windows", "owner_id": user_id},
@@ -116,7 +118,7 @@ def test_delete_user_with_lock_cascades(
     client: TestClient, configured_db: Path, auth: dict[str, str]
 ) -> None:
     """A user_lock row is metadata of the user; cascading the delete is fine."""
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     client.post("/v1/users/kid1/lock", headers=auth)
     # Sanity: lock row exists.
     with Session(_engine(configured_db)) as s:
@@ -129,7 +131,7 @@ def test_delete_user_with_lock_cascades(
 
 
 def test_delete_unauthenticated(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     assert client.delete("/v1/users/kid1").status_code == 401
 
 
@@ -139,7 +141,7 @@ def test_delete_unauthenticated(client: TestClient, auth: dict[str, str]) -> Non
 def test_audit_records_update_and_delete(
     client: TestClient, configured_db: Path, auth: dict[str, str]
 ) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     client.patch("/v1/users/kid1", json={"role": "manager"}, headers=auth)
     client.delete("/v1/users/kid1", headers=auth)
     with Session(_engine(configured_db)) as s:
