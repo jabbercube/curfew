@@ -6,6 +6,7 @@ collides between two valid concepts: the boot-time ``Settings`` BaseSettings in
 Always import explicitly from one of those modules.
 """
 
+from curfew.audit import record_audit
 from curfew.db import get_engine, get_session, make_engine, reset_engine_cache
 from curfew.models import (
     Agent,
@@ -22,6 +23,14 @@ from curfew.models import (
     UserLock,
     UserRole,
 )
+from curfew.rules import (
+    RulePipeline,
+    device_scope,
+    manual_lock_rule,
+    register_kernel_rules,
+    user_scope,
+)
+from curfew.schemas import LockStatus, Reason, UserCreate, UserRead
 
 __all__ = [
     "Agent",
@@ -32,13 +41,23 @@ __all__ = [
     "Device",
     "DeviceOS",
     "DeviceType",
+    "LockStatus",
     "Manifest",
     "Plugin",
+    "Reason",
+    "RulePipeline",
     "User",
+    "UserCreate",
     "UserLock",
+    "UserRead",
     "UserRole",
+    "device_scope",
     "get_engine",
     "get_session",
     "make_engine",
+    "manual_lock_rule",
+    "record_audit",
+    "register_kernel_rules",
     "reset_engine_cache",
+    "user_scope",
 ]
