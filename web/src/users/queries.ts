@@ -6,6 +6,7 @@ import { apiFetch } from "@/api/client";
 import type { components } from "@/api/schema";
 
 export type User = components["schemas"]["UserRead"];
+export type UserCreate = components["schemas"]["UserCreate"];
 export type LockStatus = components["schemas"]["LockStatus"];
 
 export const usersQueryOptions = queryOptions({
@@ -26,6 +27,26 @@ export const userStatusQueryOptions = (username: string) =>
 export function useUserStatuses(usernames: string[]) {
   return useQueries({
     queries: usernames.map((u) => userStatusQueryOptions(u)),
+  });
+}
+
+export function useCreateUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: UserCreate) =>
+      apiFetch<User>("/v1/users", { method: "POST", body: payload }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
+  });
+}
+
+export function useDeleteUser() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (username: string) =>
+      apiFetch<void>(`/v1/users/${encodeURIComponent(username)}`, {
+        method: "DELETE",
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
   });
 }
 

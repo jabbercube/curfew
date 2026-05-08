@@ -1,16 +1,13 @@
-import { createFileRoute, redirect } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
-import { meQueryOptions } from "@/auth/useMe";
-import { Layout } from "@/components/Layout";
+import { requireAuthenticated } from "@/auth/admin-guard";
+import { AdminLayout } from "@/components/AdminLayout";
 import { UserLockRow } from "@/components/UserLockRow";
 import { usersQueryOptions, useUserStatuses } from "@/users/queries";
 
 export const Route = createFileRoute("/")({
-  beforeLoad: async ({ context, location }) => {
-    const me = await context.queryClient.ensureQueryData(meQueryOptions);
-    if (!me) {
-      throw redirect({ to: "/login", search: { redirect: location.href } });
-    }
+  beforeLoad: async ({ context }) => {
+    await requireAuthenticated(context);
     // Warm the users query so the dashboard renders without a flash of empty.
     await context.queryClient.ensureQueryData(usersQueryOptions);
   },
@@ -23,7 +20,7 @@ function Dashboard() {
   const statuses = useUserStatuses(usernames);
 
   return (
-    <Layout>
+    <AdminLayout>
       <div className="space-y-4">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Users</h1>
@@ -49,6 +46,6 @@ function Dashboard() {
           })}
         </ul>
       </div>
-    </Layout>
+    </AdminLayout>
   );
 }

@@ -3,13 +3,17 @@ import { Link, useNavigate } from "@tanstack/react-router";
 import { LogOut } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Separator } from "@/components/ui/separator";
 import { DarkModeToggle } from "@/components/DarkModeToggle";
+import { Sidebar } from "@/components/Sidebar";
 import { useLogout, useMe } from "@/auth/useMe";
 
-// Header + main content shell. Sidebar lands when admin CRUD pages do
-// (slice 1 has only one screen, so no nav destinations to populate one).
+// Sidebar + content shell for protected pages. The sidebar shows on md+
+// screens; on mobile, only the header is visible (no nav drawer in this
+// slice — three pages don't justify the chrome). When the admin CRUD
+// surface grows, a Sheet-based mobile drawer is the natural follow-up.
 
-export function Layout({ children }: PropsWithChildren) {
+export function AdminLayout({ children }: PropsWithChildren) {
   const me = useMe();
   const logout = useLogout();
   const navigate = useNavigate();
@@ -17,7 +21,7 @@ export function Layout({ children }: PropsWithChildren) {
   return (
     <div className="min-h-screen bg-background text-foreground">
       <header className="border-b">
-        <div className="mx-auto flex h-14 max-w-5xl items-center justify-between gap-4 px-4">
+        <div className="mx-auto flex h-14 max-w-6xl items-center justify-between gap-4 px-4">
           <Link to="/" className="font-semibold tracking-tight">
             curfew
           </Link>
@@ -49,7 +53,13 @@ export function Layout({ children }: PropsWithChildren) {
           </div>
         </div>
       </header>
-      <main className="mx-auto max-w-5xl px-4 py-6">{children}</main>
+      <div className="mx-auto flex max-w-6xl">
+        <aside className="hidden w-56 shrink-0 border-r md:block">
+          <Sidebar />
+        </aside>
+        <Separator orientation="vertical" className="hidden md:block" />
+        <main className="flex-1 px-4 py-6">{children}</main>
+      </div>
     </div>
   );
 }
