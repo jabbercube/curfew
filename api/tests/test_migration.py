@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "devices",
     "manifests",
     "plugins",
+    "sessions",
     "settings",
     "user_locks",
     "users",

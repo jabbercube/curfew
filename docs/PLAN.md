@@ -331,7 +331,7 @@ API: `GET /v1/settings` (read all), `PATCH /v1/settings` (update one or more). C
 
 - **Agent auth**: per-device bearer tokens (ADR-006). Hashed at rest in `agent_tokens`. Read scope is full state in the kernel; future tightening (a `gamingrig` token can only read kid1's slice) is a feature on top.
 - **Plugin auth**: none. Plugins are in-process Python modules; the core calls their `reconcile()` directly. There's no network boundary to authenticate.
-- **Operator auth**: V1 uses a single **root bearer token** (`CURFEW_ROOT_TOKEN` env var; see "Configuration and settings"), distinct from the `admin` user role (which is data-only in V1 — no way for a user with `role: admin` to authenticate yet). Per-user role-based auth (sessions tied to user records) is a feature on top of the kernel; the API surface is shaped to accept it without renames.
+- **Operator auth**: two valid paths, both enforced as a per-route FastAPI dependency. (1) **Root bearer token** (`CURFEW_ROOT_TOKEN` env var) — bootstrap and recovery, treated as a synthetic admin actor. (2) **Per-user session cookie** — `POST /v1/auth/login` against a username + Argon2 password hash issues an opaque session id stored in the `sessions` table; the cookie is HttpOnly + SameSite=Lax (Secure when https). User actors carry the user's `role` (member / manager / admin) and route gating uses `require_role(min)` to enforce it. See ADR-016.
 
 ## Audit log
 
@@ -398,6 +398,12 @@ Agent code distribution
 Settings
   GET    /v1/settings                           read all runtime-mutable settings
   PATCH  /v1/settings                           update one or more (audited)
+
+Auth
+  POST   /v1/auth/login                         { username, password } -> 204 + session cookie
+  POST   /v1/auth/logout                        clears cookie + deletes session row
+  GET    /v1/auth/me                            current actor: { kind, username, role }
+  POST   /v1/auth/change-password               { current_password, new_password } (audited)
 
 System
   GET    /v1/system/snapshot                    full system snapshot (debug; not the primary read path)

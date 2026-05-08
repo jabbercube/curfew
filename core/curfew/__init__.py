@@ -7,6 +7,7 @@ Always import explicitly from one of those modules.
 """
 
 from curfew.audit import record_audit
+from curfew.auth import Actor, root_actor
 from curfew.db import get_engine, get_session, make_engine, reset_engine_cache
 from curfew.models import (
     Agent,
@@ -22,7 +23,9 @@ from curfew.models import (
     User,
     UserLock,
     UserRole,
+    UserSession,
 )
+from curfew.passwords import hash_password, verify_password
 from curfew.rules import (
     RulePipeline,
     device_scope,
@@ -35,11 +38,14 @@ from curfew.schemas import (
     AppCreate,
     AppRead,
     AppUpdate,
+    ChangePasswordRequest,
     DeviceCreate,
     DeviceRead,
     DeviceUpdate,
     LockStatus,
+    LoginRequest,
     ManifestSnapshotRow,
+    MeResponse,
     PluginSnapshotRow,
     Reason,
     SettingsRead,
@@ -52,6 +58,7 @@ from curfew.schemas import (
 )
 
 __all__ = [
+    "Actor",
     "Agent",
     "AgentSnapshotRow",
     "AgentToken",
@@ -61,6 +68,7 @@ __all__ = [
     "AppUpdate",
     "AuditLog",
     "AuditTargetKind",
+    "ChangePasswordRequest",
     "Device",
     "DeviceCreate",
     "DeviceOS",
@@ -68,8 +76,10 @@ __all__ = [
     "DeviceType",
     "DeviceUpdate",
     "LockStatus",
+    "LoginRequest",
     "Manifest",
     "ManifestSnapshotRow",
+    "MeResponse",
     "Plugin",
     "PluginSnapshotRow",
     "Reason",
@@ -83,14 +93,18 @@ __all__ = [
     "UserLockSnapshotRow",
     "UserRead",
     "UserRole",
+    "UserSession",
     "UserUpdate",
     "device_scope",
     "get_engine",
     "get_session",
+    "hash_password",
     "make_engine",
     "manual_lock_rule",
     "record_audit",
     "register_kernel_rules",
     "reset_engine_cache",
+    "root_actor",
     "user_scope",
+    "verify_password",
 ]

@@ -56,7 +56,7 @@ def client_with_protected_stub(configured_db: Path) -> TestClient:
 
     @stub.get("/v1/_stub")
     def _stub(actor: Operator) -> dict[str, str]:
-        return {"actor": actor}
+        return {"actor": actor.audit_str}
 
     app.include_router(stub)
     return TestClient(app)

@@ -323,3 +323,53 @@ Each Python deliverable owns a `pyproject.toml`. The root `pyproject.toml` is a 
 - Every later kernel slice (auth middleware, rule pipeline, every CRUD endpoint, agent state hash, plugin discovery, audit log writes) writes against this schema. Changing PK shape after CRUD lands is a multi-day refactor across every endpoint, every test, every migration. Doing it now is one commit.
 - The PK shape ships in the OpenAPI types. Renaming `users.slug` to `users.username` after the API stabilises means breaking external clients (CLI, future GUI, future SDK consumers).
 
+## ADR-016: Per-user authentication — username + password with server-side sessions
+
+**Decided:** per-user auth uses a username + an Argon2id password hash on `users`, opaque random session ids stored in a new `sessions` table, and HttpOnly + SameSite=Lax cookies. Roles already on `User.role` (`member` / `manager` / `admin`) drive a `require_role(min)` dependency factory. The operator root token (`CURFEW_ROOT_TOKEN`) keeps working alongside per-user auth as a synthesised admin actor (`kind=root`, `audit_str="operator"`). Two routes determine ordering: bearer first, cookie fallback. Login response is `204 + Set-Cookie`; logout deletes the session row and clears the cookie; `/me` introspects the current actor.
+
+**Rejected:**
+
+- **JWTs.** Stateless tokens give up nothing this scale needs — no horizontal session-store coordination — and cost an invalidation/rotation story (denylists or short-lived + refresh tokens). Server-side sessions are a row delete to revoke; cheap and obvious.
+- **`passlib`.** Long the canonical Python password library; release cadence has stalled in recent years. `argon2-cffi` is the actively-maintained primitive `passlib` would wrap anyway. If algorithm migration ever becomes a real concern we add `passlib` then; we're not paying the abstraction cost up front.
+- **Starlette `SessionMiddleware`.** It's for *signed cookies that hold session data* (paired with `itsdangerous`). We want *opaque cookies that hold a session id*. The middleware would do the wrong thing.
+- **Migration-time admin user seeding** (e.g. `CURFEW_BOOTSTRAP_PASSWORD`). One-way trap if the password is lost. Root token remains the recovery path; operator boots, creates the first admin via `POST /v1/users`, then logs in.
+- **Login by username OR email.** Deferred with the email column itself — neither is needed to unblock the frontend, and adding a second unique column doubles the lookup matrix and error surface for "operator forgot their handle," which a password manager solves.
+- **Google OAuth.** Single-user homelab admin doesn't justify the OAuth surface (callback handling, account linking, two valid identity sources). Defer until a real user asks.
+- **Login throttling / lockout / failed-login audit.** All real concerns at internet scale; not at homelab scale where the only attacker is a kid trying their parent's password three times. Defer.
+
+**Why now:**
+
+- The frontend slice is blocked on it. Everything else in the operator UX (lock/unlock, CRUD, settings) needs role gating that the root token alone can't express.
+- The kernel API surface is otherwise complete. Adding auth before the frontend lands means the frontend's auth flow is real from day one — no stub-then-replace.
+
+**Trade-offs accepted:**
+
+- One DB row per request to refresh the session (`last_seen_at` + sliding `expires_at`). Negligible at homelab scale; if it ever isn't, sliding-on-write becomes sliding-every-N-minutes.
+- `users.password_hash` is nullable — NULL means "this user can't password-log-in." Covers users created before this migration and any future SSO-only flow. Login returns the same 401 for unknown / no-password / wrong-password so we don't leak which case applies.
+- Root token bypasses session-row tracking entirely. No way to "revoke the operator's bearer" short of rotating `CURFEW_ROOT_TOKEN`. Acceptable: the root token is bootstrap + recovery, not day-to-day.
+- Bearer-first ordering means a session cookie is only consulted when no bearer is present. Routes called with both will be authenticated as root. Considered a feature: if you've got the root token, you've got everything.
+
+## ADR-017: Frontend stack — Vite + React + TypeScript + shadcn, operator audience only
+
+**Decided:** the operator UI lives in a new `web/` workspace member, built with Vite + React + TypeScript + Tailwind + shadcn/ui + TanStack Query + TanStack Router. Static export — no SSR runtime. Audience is admins and managers only; members get no UI surface. API types are generated from `/v1/openapi.json` so request and response shapes can't drift from the API. Auth is cookie-based session (same-origin in prod; dev-server proxy to the API in dev). Frontend implementation is blocked until ADR-016 ships.
+
+**Rejected:**
+
+- **Next.js (app router).** No SSR or SEO need — this is an authenticated admin panel — and the app-router conventions (server components, async data, route groups) are more concept-surface than a homelab CRUD app justifies. Static-export Next would technically work but adds a build pipeline for nothing.
+- **HTMX + Jinja2 inside the FastAPI process.** Genuinely a strong fit for the shape (role-gated server-rendered CRUD, single deploy artifact, sessions trivially work). Rejected because the operator wants to learn modern React/TanStack tooling, the JSON-API + multi-client trajectory is already established (CLI, future agent SDK consumers reuse the same shapes), and the simplicity wins are smaller than they sound when Claude Code is doing the scaffolding.
+- **Other SPA frameworks** (SvelteKit, SolidStart). React + TanStack has the largest template / ecosystem footprint for this kind of CRUD admin and pairs natively with shadcn (which is React-only). Different framework choices win against different goals; here React wins on familiarity-at-the-edges and Claude template fit.
+- **Throwaway "Figma-style" mockups first.** The originally listed scope (auth pages, dashboard layout, API client) implies a working prototype, not paper. Scaffolding the real app first lets real-data quirks (empty states, long usernames, locked-with-many-reasons overflow) surface in the iteration loop instead of being deferred to "later."
+- **A bigger framework picker for the API client** (SWR, Redux, Zustand). TanStack Query handles server state; `useState` handles the rest; OpenAPI-generated types remove the need for hand-rolled fetchers.
+
+**Why now (decision, not implementation):**
+
+- ADR-016 and the frontend ADR move together. Locking the stack now lets the frontend slice scaffold immediately on a clean branch when ADR-016 lands.
+- The `web/` workspace decision affects repo tooling (Node + a JS package manager land in the dev environment, devcontainer needs updating, CI gains a JS lane). Calling that out early in DECISIONS.md so the next contributor isn't surprised.
+
+**Trade-offs accepted:**
+
+- The repo gains a JS/TS toolchain alongside the Python workspace — Node + `bun` (or `pnpm`) becomes a dev prerequisite. Devcontainer + `justfile` will be extended in the frontend slice.
+- Component-level role gating in the UI is *presentation only*; the real gate is on the API (ADR-016). Hiding an admin button still requires the server to enforce admin role on the underlying call.
+- Static-export means the frontend deployment is just files: served by FastAPI itself (`StaticFiles` mount) or any static host. Simpler ops, but no edge SSR / dynamic-per-request serving — none of which V1 needs.
+- Members have no UI. If a member ever needs an "am I locked? why?" view, that's a separate audience and a separate slice (likely a tiny per-device kiosk page, not an extension of this admin app).
+

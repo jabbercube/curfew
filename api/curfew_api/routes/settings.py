@@ -22,7 +22,7 @@ from curfew.schemas import SettingsRead, SettingsUpdate
 from fastapi import APIRouter, Depends
 from sqlmodel import Session, select
 
-from curfew_api.auth import Operator
+from curfew_api.auth import RequireAdmin
 
 router = APIRouter(prefix="/v1/settings", tags=["settings"])
 
@@ -35,7 +35,7 @@ def _get_singleton(session: Session) -> Settings:
 
 @router.get("", response_model=SettingsRead)
 def get_settings(
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> Settings:
     return _get_singleton(session)
@@ -44,7 +44,7 @@ def get_settings(
 @router.patch("", response_model=SettingsRead)
 def update_settings(
     payload: SettingsUpdate,
-    actor: Operator,
+    actor: RequireAdmin,
     session: Annotated[Session, Depends(get_session)],
 ) -> Settings:
     row = _get_singleton(session)

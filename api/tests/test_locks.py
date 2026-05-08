@@ -23,7 +23,7 @@ def _engine(db: Path):
 
 
 def test_create_user_returns_201_with_id(client: TestClient, auth: dict[str, str]) -> None:
-    r = client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    r = client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     assert r.status_code == 201
     body = r.json()
     assert body["username"] == "kid1"
@@ -33,18 +33,18 @@ def test_create_user_returns_201_with_id(client: TestClient, auth: dict[str, str
 
 
 def test_create_user_409_on_duplicate(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
-    r = client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
+    r = client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     assert r.status_code == 409
 
 
 def test_create_user_unauthenticated(client: TestClient) -> None:
-    r = client.post("/v1/users", json={"username": "kid1"})
+    r = client.post("/v1/users", json={"username": "kid1", "password": "test1234"})
     assert r.status_code == 401
 
 
 def test_get_user(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     r = client.get("/v1/users/kid1", headers=auth)
     assert r.status_code == 200
     assert r.json()["username"] == "kid1"
@@ -59,14 +59,14 @@ def test_get_user_404(client: TestClient, auth: dict[str, str]) -> None:
 
 
 def test_status_unlocked_initially(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     r = client.get("/v1/users/kid1/status", headers=auth)
     assert r.status_code == 200
     assert r.json() == {"locked": False, "reasons": []}
 
 
 def test_lock_then_status_returns_locked(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     r = client.post("/v1/users/kid1/lock", headers=auth)
     assert r.status_code == 200
     assert r.json() == {"locked": True, "reasons": [{"kind": "manual_lock"}]}
@@ -76,7 +76,7 @@ def test_lock_then_status_returns_locked(client: TestClient, auth: dict[str, str
 
 
 def test_unlock_clears_lock(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     client.post("/v1/users/kid1/lock", headers=auth)
     r = client.post("/v1/users/kid1/unlock", headers=auth)
     assert r.status_code == 200
@@ -85,7 +85,7 @@ def test_unlock_clears_lock(client: TestClient, auth: dict[str, str]) -> None:
 
 def test_lock_idempotent(client: TestClient, auth: dict[str, str]) -> None:
     """Calling lock twice keeps the user locked, no error."""
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     client.post("/v1/users/kid1/lock", headers=auth)
     r = client.post("/v1/users/kid1/lock", headers=auth)
     assert r.status_code == 200
@@ -101,7 +101,7 @@ def test_status_skips_unmanaged_user(client: TestClient, auth: dict[str, str]) -
     """managed=False users always return unlocked even if the lock row is true."""
     client.post(
         "/v1/users",
-        json={"username": "adult", "role": "manager", "managed": False},
+        json={"username": "adult", "role": "manager", "managed": False, "password": "test1234"},
         headers=auth,
     )
     # Lock the user directly (the endpoint also works on unmanaged users —
@@ -140,7 +140,7 @@ def test_device_status_empty_pipeline_in_kernel(
 def test_audit_records_user_create(
     client: TestClient, configured_db: Path, auth: dict[str, str]
 ) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     with Session(_engine(configured_db)) as s:
         rows = s.exec(select(AuditLog).where(AuditLog.action == "user.create")).all()
     assert len(rows) == 1
@@ -154,7 +154,7 @@ def test_audit_records_user_create(
 def test_audit_records_lock_and_unlock(
     client: TestClient, configured_db: Path, auth: dict[str, str]
 ) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    client.post("/v1/users", json={"username": "kid1", "password": "test1234"}, headers=auth)
     client.post("/v1/users/kid1/lock", headers=auth)
     client.post("/v1/users/kid1/unlock", headers=auth)
     with Session(_engine(configured_db)) as s:

@@ -19,13 +19,14 @@ from typing import Any
 
 from sqlmodel import Session
 
+from curfew.auth import Actor
 from curfew.models import AuditLog, AuditTargetKind
 
 
 def record_audit(
     session: Session,
     *,
-    actor: str,
+    actor: Actor | str,
     action: str,
     target_kind: AuditTargetKind,
     target_id: str,
@@ -38,8 +39,10 @@ def record_audit(
     back together if the route fails).
 
     Args:
-        actor: Identifier of who initiated the change. ``"operator"`` for V1
-            (root token); future per-user auth uses the username.
+        actor: The principal initiating the change. Pass an ``Actor`` from a
+            FastAPI dep — the helper writes ``actor.audit_str`` (``"operator"``
+            for root, the username for users). Bare strings are accepted for
+            internal-only call sites that already produce an audit string.
         action: Dotted verb naming the operation (e.g. ``"user.lock"``,
             ``"user.create"``). Caller's responsibility — keep it consistent
             so audit queries by ``action`` work.
@@ -48,8 +51,9 @@ def record_audit(
             a string so audit values survive deletion of the target (PLAN.md).
         payload: Action-specific JSON-serialisable detail.
     """
+    actor_str = actor.audit_str if isinstance(actor, Actor) else actor
     row = AuditLog(
-        actor=actor,
+        actor=actor_str,
         action=action,
         target_kind=target_kind,
         target_id=target_id,

@@ -49,6 +49,7 @@ class LockStatus(BaseModel):
 
 class UserCreate(BaseModel):
     username: str
+    password: str = Field(min_length=8)
     role: UserRole = UserRole.MEMBER
     managed: bool = True
 
@@ -130,6 +131,27 @@ class AppUpdate(BaseModel):
     exe_paths: list[str] | None = None
     process_names: list[str] | None = None
     urls: list[str] | None = None
+
+
+# --- Auth ---------------------------------------------------------------------
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class MeResponse(BaseModel):
+    """Identity payload for the current actor — drives frontend nav state."""
+
+    kind: str  # "root" | "user"
+    username: str | None
+    role: UserRole
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8)
 
 
 # --- Settings -----------------------------------------------------------------

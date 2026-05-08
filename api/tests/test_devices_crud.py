@@ -15,7 +15,7 @@ def _engine(db: Path):
 
 def _create_user(client: TestClient, auth: dict[str, str], username: str = "kid1") -> int:
     """Create a user and return its id."""
-    r = client.post("/v1/users", json={"username": username}, headers=auth)
+    r = client.post("/v1/users", json={"username": username, "password": "test1234"}, headers=auth)
     assert r.status_code == 201
     user_id = r.json()["id"]
     assert isinstance(user_id, int)
