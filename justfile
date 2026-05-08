@@ -69,7 +69,10 @@ serve: migrate
 #   just user-create alice test1234           # admin alice
 #   just user-create kid1 kid12345 member     # managed member kid1
 user-create username password role="admin" host="http://localhost:8000":
-    curl -fsS -X POST \
+    # --fail-with-body (curl 7.76+) prints the response body AND exits non-zero
+    # on 4xx/5xx, so the FastAPI 422 detail (e.g. "password too short") is
+    # actually visible. Plain `-f` would swallow it.
+    curl --fail-with-body -sS -X POST \
         -H "Authorization: Bearer $CURFEW_ROOT_TOKEN" \
         -H "Content-Type: application/json" \
         -d '{"username":"{{username}}","password":"{{password}}","role":"{{role}}"}' \
