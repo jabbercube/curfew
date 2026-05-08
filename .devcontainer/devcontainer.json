@@ -3,11 +3,15 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
-  "postCreateCommand": "uv sync --all-packages --group dev && uv run pre-commit install",
-  "forwardPorts": [8000],
+  "postCreateCommand": "uv sync --all-packages --group dev && uv run pre-commit install && cd web && bun install",
+  "forwardPorts": [8000, 5173],
   "portsAttributes": {
     "8000": {
       "label": "curfew-core",
+      "onAutoForward": "notify"
+    },
+    "5173": {
+      "label": "curfew-web (vite dev)",
       "onAutoForward": "notify"
     }
   },
@@ -23,7 +27,10 @@
         "ms-python.mypy-type-checker",
         "tamasfe.even-better-toml",
         "ms-azuretools.vscode-docker",
-        "skellock.just"
+        "skellock.just",
+        "bradlc.vscode-tailwindcss",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode"
       ],
       "settings": {
         "python.defaultInterpreterPath": "${containerWorkspaceFolder}/.venv/bin/python",
