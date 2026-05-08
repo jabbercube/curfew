@@ -101,10 +101,10 @@ def test_delete_missing_user_404(client: TestClient, auth: dict[str, str]) -> No
 
 
 def test_delete_user_with_devices_409(client: TestClient, auth: dict[str, str]) -> None:
-    client.post("/v1/users", json={"username": "kid1"}, headers=auth)
+    user_id = client.post("/v1/users", json={"username": "kid1"}, headers=auth).json()["id"]
     client.post(
         "/v1/devices",
-        json={"slug": "rig", "type": "pc", "os": "windows", "owner": "kid1"},
+        json={"slug": "rig", "type": "pc", "os": "windows", "owner_id": user_id},
         headers=auth,
     )
     r = client.delete("/v1/users/kid1", headers=auth)

@@ -73,26 +73,30 @@ class DeviceCreate(BaseModel):
     slug: str
     type: DeviceType
     os: DeviceOS
-    owner: str | None = None  # username of the owning user; None = shared
+    owner_id: int | None = None  # FK to users.id; None = shared device
     mac: list[str] = Field(default_factory=list)
     managed: bool = True
 
 
 class DeviceRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     slug: str
     type: DeviceType
     os: DeviceOS
-    owner: str | None  # username (resolved from owner_id)
+    owner_id: int | None
     mac: list[str]
     managed: bool
 
 
 class DeviceUpdate(BaseModel):
+    """All fields optional. Send ``owner_id: null`` to clear the owner."""
+
     slug: str | None = None
     type: DeviceType | None = None
     os: DeviceOS | None = None
-    owner: str | None = None  # set to "" to clear owner — see route handler
+    owner_id: int | None = None
     mac: list[str] | None = None
     managed: bool | None = None
 

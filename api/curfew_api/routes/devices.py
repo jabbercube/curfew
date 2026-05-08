@@ -1,9 +1,8 @@
 """Device CRUD.
 
-API uses ``owner: str | None`` (the owning user's username), translated to/from
-``owner_id`` internally. Owner lookup is one query per device — fine at homelab
-scale (≤30 devices). If that ever shows up in profiling, swap to a single LEFT
-JOIN in ``list_devices``.
+API uses ``owner_id: int | None`` directly — same shape the DB stores. Clients
+that hold usernames look up the id once via ``GET /v1/users/{user}`` and post
+the id. No translation layer in this module.
 """
 
 from __future__ import annotations
@@ -23,39 +22,6 @@ from curfew_api.auth import Operator
 router = APIRouter(prefix="/v1/devices", tags=["devices"])
 
 
-def _resolve_owner_username(session: Session, owner_id: int | None) -> str | None:
-    if owner_id is None:
-        return None
-    user = session.get(User, owner_id)
-    return user.username if user is not None else None
-
-
-def _resolve_owner_id(session: Session, owner_username: str | None) -> int | None:
-    """Look up owner_id by username; raise 404 if a non-null username doesn't exist."""
-    if owner_username is None:
-        return None
-    user = session.exec(select(User).where(User.username == owner_username)).first()
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"owner user {owner_username!r} not found",
-        )
-    assert user.id is not None
-    return user.id
-
-
-def _to_read(session: Session, device: Device) -> DeviceRead:
-    return DeviceRead(
-        id=device.id,  # type: ignore[arg-type]  # populated by DB after flush
-        slug=device.slug,
-        type=device.type,
-        os=device.os,
-        owner=_resolve_owner_username(session, device.owner_id),
-        mac=list(device.mac),
-        managed=device.managed,
-    )
-
-
 def _get_device_or_404(session: Session, slug: str) -> Device:
     row = session.exec(select(Device).where(Device.slug == slug)).first()
     if row is None:
@@ -63,13 +29,27 @@ def _get_device_or_404(session: Session, slug: str) -> Device:
     return row
 
 
+def _validate_owner_id(session: Session, owner_id: int | None) -> None:
+    """Pre-check that the owner_id resolves to an existing user.
+
+    Catching the FK violation post-INSERT would also work but yields opaque
+    errors. A pre-check gives a clean 404 with the offending id.
+    """
+    if owner_id is None:
+        return
+    if session.get(User, owner_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"owner_id {owner_id} not found",
+        )
+
+
 @router.get("", response_model=list[DeviceRead])
 def list_devices(
     actor: Operator,
     session: Annotated[Session, Depends(get_session)],
-) -> list[DeviceRead]:
-    rows = session.exec(select(Device).order_by(Device.slug)).all()
-    return [_to_read(session, d) for d in rows]
+) -> list[Device]:
+    return list(session.exec(select(Device).order_by(Device.slug)).all())
 
 
 @router.post("", response_model=DeviceRead, status_code=status.HTTP_201_CREATED)
@@ -77,11 +57,11 @@ def create_device(
     payload: DeviceCreate,
     actor: Operator,
     session: Annotated[Session, Depends(get_session)],
-) -> DeviceRead:
-    owner_id = _resolve_owner_id(session, payload.owner)
+) -> Device:
+    _validate_owner_id(session, payload.owner_id)
     device = Device(
         slug=payload.slug,
-        owner_id=owner_id,
+        owner_id=payload.owner_id,
         type=payload.type,
         os=payload.os,
         mac=payload.mac,
@@ -105,13 +85,13 @@ def create_device(
         payload={
             "type": device.type.value,
             "os": device.os.value,
-            "owner": payload.owner,
+            "owner_id": device.owner_id,
             "managed": device.managed,
         },
     )
     session.commit()
     session.refresh(device)
-    return _to_read(session, device)
+    return device
 
 
 @router.get("/{device}", response_model=DeviceRead)
@@ -119,8 +99,8 @@ def get_device(
     device: str,
     actor: Operator,
     session: Annotated[Session, Depends(get_session)],
-) -> DeviceRead:
-    return _to_read(session, _get_device_or_404(session, device))
+) -> Device:
+    return _get_device_or_404(session, device)
 
 
 @router.patch("/{device}", response_model=DeviceRead)
@@ -129,21 +109,16 @@ def update_device(
     payload: DeviceUpdate,
     actor: Operator,
     session: Annotated[Session, Depends(get_session)],
-) -> DeviceRead:
+) -> Device:
     row = _get_device_or_404(session, device)
     update_data = payload.model_dump(exclude_unset=True)
     if not update_data:
-        return _to_read(session, row)
+        return row
+
+    if "owner_id" in update_data:
+        _validate_owner_id(session, update_data["owner_id"])
 
     original_slug = row.slug
-    audit_payload = dict(update_data)  # what the client sent, for the audit row
-
-    # Owner is the only field that needs username→id translation; pop it out so
-    # the generic setattr loop below doesn't try to set Device.owner (which
-    # doesn't exist — the model has owner_id).
-    if "owner" in update_data:
-        row.owner_id = _resolve_owner_id(session, update_data.pop("owner"))
-
     for field, value in update_data.items():
         setattr(row, field, value)
     session.add(row)
@@ -162,11 +137,11 @@ def update_device(
         action="device.update",
         target_kind=AuditTargetKind.DEVICE,
         target_id=original_slug,
-        payload=audit_payload,
+        payload=update_data,
     )
     session.commit()
     session.refresh(row)
-    return _to_read(session, row)
+    return row
 
 
 @router.delete("/{device}", status_code=status.HTTP_204_NO_CONTENT)
@@ -177,8 +152,7 @@ def delete_device(
 ) -> None:
     row = _get_device_or_404(session, device)
 
-    # 409 if an agent is installed on the device; operator must `agent uninstall`
-    # first. Cascading the agent + its tokens would be silent privilege loss.
+    # 409 if an agent is installed; operator must `agent uninstall` first.
     has_agent = session.exec(select(Agent).where(Agent.device_id == row.id)).first()
     if has_agent is not None:
         raise HTTPException(
