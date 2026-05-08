@@ -7,7 +7,10 @@ name = "curfew"
 version = "0.0.0"
 description = "Shared library: models, schemas, rule pipeline, Plugin base class"
 requires-python = ">=3.13"
-dependencies = ["sqlmodel>=0.0.22"]
+dependencies = [
+    "sqlmodel>=0.0.22",
+    "pydantic-settings>=2.5",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["curfew"]

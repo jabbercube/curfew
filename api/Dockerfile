@@ -12,4 +12,8 @@ COPY agents ./agents
 
 RUN uv sync --frozen --no-dev --package curfew-api
 
-CMD ["uv", "run", "--package", "curfew-api", "python", "-c", "print('curfew-core not yet implemented')"]
+EXPOSE 8000
+
+# Apply migrations on startup, then serve. The DB lives at /var/lib/curfew/state.sqlite
+# (compose.yml mounts a volume there); CURFEW_DB_PATH is set by the operator to match.
+CMD ["sh", "-c", "cd api && uv run alembic upgrade head && cd .. && uv run uvicorn curfew_api.app:create_app --factory --host 0.0.0.0 --port 8000"]

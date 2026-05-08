@@ -3,5 +3,11 @@ services:
     build:
       context: ..
       dockerfile: api/Dockerfile
+    environment:
+      CURFEW_DB_PATH: /var/lib/curfew/state.sqlite
+      CURFEW_ROOT_TOKEN: ${CURFEW_ROOT_TOKEN:?CURFEW_ROOT_TOKEN must be set}
+      CURFEW_LOG_LEVEL: info
+    ports:
+      - "8000:8000"
     volumes:
       - ./state:/var/lib/curfew
