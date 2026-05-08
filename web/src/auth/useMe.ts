@@ -44,7 +44,15 @@ export function useLogin() {
   return useMutation({
     mutationFn: (payload: LoginRequest) =>
       apiFetch<void>("/v1/auth/login", { method: "POST", body: payload }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ME_QUERY_KEY }),
+    // We have to physically replace the cached actor because the route
+    // `beforeLoad` guards use `ensureQueryData`, which returns cached data
+    // regardless of stale flag. `staleTime: Infinity` on meQueryOptions also
+    // makes `fetchQuery` short-circuit. So we clear the cache, then refetch
+    // — that's what plants the new actor synchronously before navigate fires.
+    onSuccess: async () => {
+      qc.removeQueries({ queryKey: ME_QUERY_KEY });
+      await qc.fetchQuery(meQueryOptions);
+    },
   });
 }
 
@@ -52,6 +60,12 @@ export function useLogout() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: () => apiFetch<void>("/v1/auth/logout", { method: "POST" }),
-    onSettled: () => qc.invalidateQueries({ queryKey: ME_QUERY_KEY }),
+    // Same reason as useLogin: route guards read the cache synchronously, so
+    // we have to plant the new value (null = unauthenticated) directly. A
+    // refetch would also work but adds a request the server already told us
+    // the answer to.
+    onSettled: () => {
+      qc.setQueryData<Me | null>(ME_QUERY_KEY, null);
+    },
   });
 }
