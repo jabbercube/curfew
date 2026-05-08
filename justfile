@@ -4,6 +4,14 @@
 # installer without re-shimming PATH for `just`.
 export PATH := env_var('HOME') / ".bun/bin:" + env_var('PATH')
 
+# Pin CURFEW_DB_PATH to <repo>/state.sqlite by default so `migrate` (which
+# cd's into api/) and `serve` (which runs from the repo root) agree on one
+# file. The env_var_or_default honours an explicit CURFEW_DB_PATH so docker
+# / CI / production deploys aren't disturbed. Tests set their own via
+# monkeypatch and don't see this. The Docker image's ENV override is
+# untouched (just doesn't pass this through to `docker run`).
+export CURFEW_DB_PATH := env_var_or_default('CURFEW_DB_PATH', justfile_directory() / 'state.sqlite')
+
 _default:
     @just --list
 
