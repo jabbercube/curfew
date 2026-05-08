@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR/.claude/plans\" 2>/dev/null || exit 0; d=$(date +%Y-%m-%d); for f in *.md; do [ -e \"$f\" ] || continue; case \"$f\" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*) ;; *) mv \"$f\" \"$d-$f\" ;; esac; done"
+            "command": "cd \"$CLAUDE_PROJECT_DIR/.claude/plans\" 2>/dev/null || exit 0; d=$(date +%Y-%m-%d); for f in *.md; do [ -e \"$f\" ] || continue; case \"$f\" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*) ;; *) t=\"$d-$f\"; if [ -e \"$t\" ]; then b=\"${t%.md}\"; i=2; while [ -e \"$b-$i.md\" ]; do i=$((i+1)); done; t=\"$b-$i.md\"; echo \"plans hook: collision on $d-$f, renamed to $t\" >&2; fi; mv -n \"$f\" \"$t\" ;; esac; done"
           }
         ]
       }
