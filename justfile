@@ -12,6 +12,16 @@ export PATH := env_var('HOME') / ".bun/bin:" + env_var('PATH')
 # untouched (just doesn't pass this through to `docker run`).
 export CURFEW_DB_PATH := env_var_or_default('CURFEW_DB_PATH', justfile_directory() / 'state.sqlite')
 
+# Default CURFEW_ROOT_TOKEN to the same clearly-fake value the devcontainer
+# uses (.devcontainer/devcontainer.json containerEnv) so a fresh host shell
+# can `just serve` / `just user-create` without remembering to export it.
+# env_var_or_default still honours an explicit CURFEW_ROOT_TOKEN, so docker
+# / CI / production set their own and aren't disturbed. The token name
+# screams "dev only" — anyone deploying with `dev-token-not-secure` as the
+# real token deserves what they get; the string is also a useful audit
+# signal if it ever leaks.
+export CURFEW_ROOT_TOKEN := env_var_or_default('CURFEW_ROOT_TOKEN', 'dev-token-not-secure')
+
 _default:
     @just --list
 

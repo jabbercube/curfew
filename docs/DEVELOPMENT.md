@@ -30,8 +30,10 @@ brew install uv just sqlite                       # macOS
 
 just sync                                         # install workspace + pre-commit hooks
 just check                                        # ruff + ruff format + mypy + pytest
-CURFEW_ROOT_TOKEN=secret just serve               # uvicorn on http://127.0.0.1:8000
+just serve                                        # uvicorn on http://127.0.0.1:8000
 ```
+
+The justfile defaults `CURFEW_ROOT_TOKEN` to `dev-token-not-secure` (matching the devcontainer) so `just serve` and `just user-create` Just Work in a fresh shell. Set the env var explicitly to override — and don't ship that string to anything reachable from outside your machine.
 
 ## `just` recipes
 
@@ -46,7 +48,7 @@ CURFEW_ROOT_TOKEN=secret just serve               # uvicorn on http://127.0.0.1:
 | `just typecheck` | `mypy` against the strict packages (`curfew`, `curfew_api`) |
 | `just test` (`just test -k name` etc.) | `pytest` with optional args passed through |
 | `just migrate` | `cd api && alembic upgrade head` against the configured DB |
-| `just serve` | `migrate` then `uvicorn` on port 8000. Requires `CURFEW_ROOT_TOKEN`. |
+| `just serve` | `migrate` then `uvicorn` on port 8000. `CURFEW_ROOT_TOKEN` defaults to `dev-token-not-secure`; export to override. |
 | `just user-create <username> <password> [role]` | Bootstrap a user via the root token (role defaults to `admin`). Needs `just serve` running. |
 | `just docker-build` | Build the curfew-core image locally |
 | `just docker-run` | Run the curfew-core image (passes `CURFEW_ROOT_TOKEN` from your shell) |
@@ -119,7 +121,7 @@ just user-create alice test1234            # admin (default role)
 just user-create kid1 kid12345 member      # managed member you can lock
 ```
 
-Then sign in to the SPA as `alice` / `test1234`. The recipe needs `CURFEW_ROOT_TOKEN` in the environment (the devcontainer sets it; on a host shell, `export` it or prefix the command).
+Then sign in to the SPA as `alice` / `test1234`. The justfile defaults `CURFEW_ROOT_TOKEN` to `dev-token-not-secure`; export the variable to override.
 
 **Web-specific recipes:**
 
@@ -139,7 +141,7 @@ Then sign in to the SPA as `alice` / `test1234`. The recipe needs `CURFEW_ROOT_T
 
 ## Common gotchas
 
-- **`just serve` fails with "ValidationError"** — `CURFEW_ROOT_TOKEN` is required and has no default. Set it in your shell or your `.env`.
+- **`just serve` fails with "ValidationError"** — only happens if you bypass `just` and invoke `uvicorn` directly without `CURFEW_ROOT_TOKEN`. The justfile defaults the var; running through `just serve` (or the devcontainer) avoids this.
 - **`alembic upgrade head` fails with "Path doesn't exist: migrations"** — Alembic resolves `script_location` relative to the working directory. Run from `api/`, not the repo root.
 - **`pytest` collects 0 tests after a failed run** — leftover `__pycache__` directories may shadow renamed test files. `just clean` and re-run.
 - **`mypy` complains about a missing `py.typed`** — every Python package in the workspace ships a `py.typed` marker. If you add a new package, add the marker too.
