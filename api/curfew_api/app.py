@@ -15,7 +15,8 @@ from curfew.rules import register_kernel_rules
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from curfew_api.routes import apps, devices, health, locks, status, users
+from curfew_api.routes import apps, devices, health, locks, status, system, users
+from curfew_api.routes.settings import router as settings_router
 
 
 def create_app() -> FastAPI:
@@ -45,5 +46,7 @@ def create_app() -> FastAPI:
     app.include_router(apps.router)
     app.include_router(locks.router)
     app.include_router(status.router)
+    app.include_router(settings_router)
+    app.include_router(system.router)
 
     return app

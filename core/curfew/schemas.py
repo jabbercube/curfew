@@ -16,6 +16,8 @@ so a PATCH with one field doesn't blank the rest.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from curfew.models import DeviceOS, DeviceType, UserRole
@@ -52,6 +54,8 @@ class UserCreate(BaseModel):
 
 
 class UserRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     username: str
     role: UserRole
@@ -112,6 +116,8 @@ class AppCreate(BaseModel):
 
 
 class AppRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     slug: str
     exe_paths: list[str]
@@ -124,3 +130,91 @@ class AppUpdate(BaseModel):
     exe_paths: list[str] | None = None
     process_names: list[str] | None = None
     urls: list[str] | None = None
+
+
+# --- Settings -----------------------------------------------------------------
+
+
+class SettingsRead(BaseModel):
+    """The runtime-mutable kernel tunables (singleton row)."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    agent_tick_seconds: int
+    manifest_tick_seconds: int
+    plugin_resync_seconds: int
+    plugin_reconcile_timeout_seconds: int
+    audit_retention_days: int
+
+
+class SettingsUpdate(BaseModel):
+    """Partial update; ``Field(gt=0)`` rejects zero/negative tick values at the boundary."""
+
+    agent_tick_seconds: int | None = Field(default=None, gt=0)
+    manifest_tick_seconds: int | None = Field(default=None, gt=0)
+    plugin_resync_seconds: int | None = Field(default=None, gt=0)
+    plugin_reconcile_timeout_seconds: int | None = Field(default=None, gt=0)
+    audit_retention_days: int | None = Field(default=None, gt=0)
+
+
+# --- System snapshot ----------------------------------------------------------
+#
+# These ``*SnapshotRow`` shapes are deliberately minimal — they exist for the
+# diagnostic dump and don't aspire to be full Read schemas. When the
+# corresponding CRUD lands (agents, plugins, manifests), promote to proper
+# Read schemas and let the snapshot reuse them.
+
+
+class AgentSnapshotRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    device_id: int
+    type: str
+    last_heartbeat: datetime | None
+    last_seen_version: str | None
+
+
+class PluginSnapshotRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    type: str
+    instance_id: str
+    users: list[str]
+    paused: bool
+
+
+class UserLockSnapshotRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    user_id: int
+    manual_lock: bool
+    set_at: datetime
+    set_by: str | None
+
+
+class ManifestSnapshotRow(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    type: str
+    version: str
+    sha256: str
+    url: str
+
+
+class SystemSnapshot(BaseModel):
+    """Aggregate dump of live system state for diagnostics / backup.
+
+    ``audit_log`` and ``agent_tokens`` deliberately stay out of the dump:
+    audit_log is unbounded; agent_tokens stores secret hashes. The ``counts``
+    block surfaces the row counts so operators still know they exist.
+    """
+
+    users: list[UserRead]
+    devices: list[DeviceRead]
+    apps: list[AppRead]
+    agents: list[AgentSnapshotRow]
+    plugins: list[PluginSnapshotRow]
+    user_locks: list[UserLockSnapshotRow]
+    manifests: list[ManifestSnapshotRow]
+    settings: SettingsRead
+    counts: dict[str, int]
