@@ -47,6 +47,7 @@ CURFEW_ROOT_TOKEN=secret just serve               # uvicorn on http://127.0.0.1:
 | `just test` (`just test -k name` etc.) | `pytest` with optional args passed through |
 | `just migrate` | `cd api && alembic upgrade head` against the configured DB |
 | `just serve` | `migrate` then `uvicorn` on port 8000. Requires `CURFEW_ROOT_TOKEN`. |
+| `just user-create <username> <password> [role]` | Bootstrap a user via the root token (role defaults to `admin`). Needs `just serve` running. |
 | `just docker-build` | Build the curfew-core image locally |
 | `just docker-run` | Run the curfew-core image (passes `CURFEW_ROOT_TOKEN` from your shell) |
 | `just clean` | Remove `.venv`, caches, and any local SQLite files |
@@ -111,16 +112,14 @@ just web-dev                              # terminal 2: Vite on :5173
 
 Vite proxies `/v1/*` to `:8000` so the browser sees one origin and cookies + auth Just Work. Open http://localhost:5173.
 
-**First-run bootstrap:** the API has no users yet. Use the root token to create one:
+**First-run bootstrap:** the API has no users yet. The `just user-create` recipe wraps the root-token CRUD call so you don't have to remember the curl shape:
 
 ```sh
-curl -X POST -H 'Authorization: Bearer dev-token-not-secure' \
-     -H 'Content-Type: application/json' \
-     -d '{"username":"alice","password":"test1234","role":"admin"}' \
-     http://localhost:8000/v1/users
+just user-create alice test1234            # admin (default role)
+just user-create kid1 kid12345 member      # managed member you can lock
 ```
 
-Then sign in as `alice` / `test1234`.
+Then sign in to the SPA as `alice` / `test1234`. The recipe needs `CURFEW_ROOT_TOKEN` in the environment (the devcontainer sets it; on a host shell, `export` it or prefix the command).
 
 **Web-specific recipes:**
 
