@@ -115,9 +115,9 @@ If a plugin folder is malformed (missing manifest, broken Python, requirements f
    ```
    curfew plugin assign adguard \
      --config '{"url": "http://adguard.local/control", "api_token_env": "ADGUARD_TOKEN"}' \
-     --governs '["*"]'
+     --users '["*"]'
    ```
-   Curfew validates the config against `Config` (the Pydantic model from manifest.toml's `config_schema`). On success, inserts a row into `plugins(type=adguard, instance_id="", config=..., governs=["*"], paused=false)` and instantiates `AdGuardPlugin` in memory.
+   Curfew validates the config against `Config` (the Pydantic model from manifest.toml's `config_schema`). On success, inserts a row into `plugins(type=adguard, instance_id="", config=..., users=["*"], paused=false)` and instantiates `AdGuardPlugin` in memory.
 3. **State changes.** Operator runs `curfew lock kid1`. Core flips `manual_lock=true`, computes the new effective lock status. The lock command's HTTP response returns immediately. In the background, curfew schedules `reconcile()` on every plugin governing kid1 → `adguard.reconcile(scope=...)` runs as a background task. The plugin makes HTTP calls to AdGuard. Success or failure is logged and audited; either way, the operator's lock command already succeeded. This means slow or broken plugins don't delay the operator's UX, but the operator must check the audit log if they need to confirm a specific plugin actually reconciled.
 4. **Safety-net resync.** Every `plugin_resync_seconds` (default 300s = 5 min), curfew-core walks every governed user and calls `reconcile()` on every plugin that governs them. Catches missed events from a plugin restart or a momentarily dropped state change.
 5. **Pause.** `curfew plugin pause adguard`. Sets `paused=true`. Reconciliation skips this plugin until unpause. The instance stays loaded; no state lost.
@@ -178,7 +178,7 @@ Say you want curfew to flip a Wyze smart plug when kid1 is locked. Wyze isn't in
    ```
    curfew plugin assign wyze \
      --config '{"email": "you@example.com", "password_env": "WYZE_PASSWORD", "device_mac": "AA:BB:CC:DD:EE:FF"}' \
-     --governs '["kid1"]'
+     --users '["kid1"]'
    ```
 
 7. **Done.** Lock kid1; the plug turns off within milliseconds.

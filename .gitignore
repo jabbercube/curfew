@@ -10,3 +10,7 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
