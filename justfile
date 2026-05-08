@@ -42,6 +42,21 @@ migrate:
 serve: migrate
     uv run uvicorn curfew_api.app:create_app --factory --host 127.0.0.1 --port 8000
 
+# Create a user via the root token. For first-run bootstrap and creating
+# test users during dev. Requires `just serve` running and CURFEW_ROOT_TOKEN
+# in the environment. Role defaults to admin so `just user-create alice
+# test1234` makes you an admin to log in as.
+#
+# Examples:
+#   just user-create alice test1234           # admin alice
+#   just user-create kid1 kid12345 member     # managed member kid1
+user-create username password role="admin" host="http://localhost:8000":
+    curl -fsS -X POST \
+        -H "Authorization: Bearer $CURFEW_ROOT_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"username":"{{username}}","password":"{{password}}","role":"{{role}}"}' \
+        {{host}}/v1/users
+
 # Build the curfew-core Docker image. Builds the SPA first so the image
 # bundles the latest UI; the Dockerfile copies web/dist into the image.
 docker-build: web-build
