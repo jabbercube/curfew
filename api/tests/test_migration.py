@@ -84,8 +84,25 @@ def test_devices_owner_fk_to_users(migrated_db: str) -> None:
     fks = inspector.get_foreign_keys("devices")
     fk_to_users = [fk for fk in fks if fk["referred_table"] == "users"]
     assert len(fk_to_users) == 1
-    assert fk_to_users[0]["constrained_columns"] == ["owner"]
-    assert fk_to_users[0]["referred_columns"] == ["slug"]
+    assert fk_to_users[0]["constrained_columns"] == ["owner_id"]
+    assert fk_to_users[0]["referred_columns"] == ["id"]
+
+
+def test_users_username_unique_index(migrated_db: str) -> None:
+    engine = create_engine(migrated_db)
+    inspector = inspect(engine)
+    indexes = {idx["name"]: idx for idx in inspector.get_indexes("users")}
+    assert "ix_users_username" in indexes
+    assert indexes["ix_users_username"]["column_names"] == ["username"]
+    assert indexes["ix_users_username"]["unique"]
+
+
+def test_devices_slug_unique_index(migrated_db: str) -> None:
+    engine = create_engine(migrated_db)
+    inspector = inspect(engine)
+    indexes = {idx["name"]: idx for idx in inspector.get_indexes("devices")}
+    assert "ix_devices_slug" in indexes
+    assert indexes["ix_devices_slug"]["unique"]
 
 
 def test_plugins_composite_pk(migrated_db: str) -> None:
@@ -110,6 +127,14 @@ def test_audit_log_indexes_present(migrated_db: str) -> None:
     assert indexes["ix_audit_log_occurred_at"] == ["occurred_at"]
     assert "ix_audit_log_target_kind_target_id" in indexes
     assert indexes["ix_audit_log_target_kind_target_id"] == ["target_kind", "target_id"]
+
+
+def test_agent_tokens_id_is_integer_pk(migrated_db: str) -> None:
+    """Surrogate INTEGER id (was UUID before; flattened in this PR)."""
+    engine = create_engine(migrated_db)
+    inspector = inspect(engine)
+    cols = {c["name"]: c for c in inspector.get_columns("agent_tokens")}
+    assert cols["id"]["type"].__class__.__name__ == "INTEGER"
 
 
 def test_downgrade_drops_all_tables(tmp_path: Path) -> None:

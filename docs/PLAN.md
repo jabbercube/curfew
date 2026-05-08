@@ -64,14 +64,14 @@ The schema is created in the initial migration with all fields the system will e
 
 | Table | Purpose |
 |-------|---------|
-| `users` | slug (PK), role, managed (bool, default true). Per-user app/schedule/budget config is deferred — see "Per-rule user config — decision deferred" below. |
-| `devices` | slug (PK), owner (FK→users, nullable), type, os, mac (JSON list), managed (bool) |
-| `apps` | slug (PK), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
-| `agents` | (device PK, FK→devices, type, config JSON, last_heartbeat nullable, last_seen_version nullable) — one row per device that has an agent installed. `type` and `config` are declarative (set at install, e.g. which Windows local user account to ACL); `last_heartbeat` and `last_seen_version` are runtime fields the agent updates on each tick. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped). The kernel records this fact; it doesn't interpret stale heartbeats as an alert (a powered-off device looks the same as a broken agent without independent reachability data — see the Reachability monitoring feature) |
-| `agent_tokens` | id (UUID PK), token_hash (UNIQUE indexed), device (FK→devices), created_at, revoked_at — bearer per device, used by the agent on that device to authenticate. The auth path queries by `token_hash`; the CLI's management identifier is `id` so the API never leaks the hash through URLs or list responses. |
-| `plugins` | (type, instance_id) PK; config JSON; users JSON list (user slugs, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`. `instance_id` is the literal string `"default"` unless the operator needs multiple instances of the same type, in which case they pick a name. URL paths use both segments (`/v1/plugins/{type}/{instance_id}`); the CLI defaults the instance_id to `default` so single-instance plugins read naturally (`curfew plugin pause adguard`) |
-| `user_locks` | user (PK, FK→users.slug), manual_lock (bool), set_at, set_by |
-| `audit_log` | id (PK), actor, action, target_kind (enum: user/device/app/agent/plugin/settings/manifest), target_id, payload (JSON), occurred_at. Indexed on `occurred_at` (for retention pruning) and `(target_kind, target_id)` (for "all events for kid1" queries). |
+| `users` | id (INTEGER PK), username (UNIQUE indexed), role, managed (bool, default true). Per-user app/schedule/budget config is deferred — see "Per-rule user config — decision deferred" below. |
+| `devices` | id (INTEGER PK), slug (UNIQUE indexed), owner_id (FK→users.id, nullable), type, os, mac (JSON list), managed (bool) |
+| `apps` | id (INTEGER PK), slug (UNIQUE indexed), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
+| `agents` | (device_id INTEGER PK, FK→devices.id), type, config JSON, last_heartbeat nullable, last_seen_version nullable — one row per device that has an agent installed. `type` and `config` are declarative (set at install, e.g. which Windows local user account to ACL); `last_heartbeat` and `last_seen_version` are runtime fields the agent updates on each tick. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped). The kernel records this fact; it doesn't interpret stale heartbeats as an alert (a powered-off device looks the same as a broken agent without independent reachability data — see the Reachability monitoring feature) |
+| `agent_tokens` | id (INTEGER PK), token_hash (UNIQUE indexed), device_id (FK→devices.id), created_at, revoked_at — bearer per device, used by the agent on that device to authenticate. The auth path queries by `token_hash`; the CLI's management identifier is `id` so the API never leaks the hash through URLs or list responses. |
+| `plugins` | (type, instance_id) PK; config JSON; users JSON list (usernames, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`. `instance_id` is the literal string `"default"` unless the operator needs multiple instances of the same type, in which case they pick a name. URL paths use both segments (`/v1/plugins/{type}/{instance_id}`); the CLI defaults the instance_id to `default` so single-instance plugins read naturally (`curfew plugin pause adguard`) |
+| `user_locks` | user_id (PK, FK→users.id), manual_lock (bool), set_at, set_by |
+| `audit_log` | id (INTEGER PK), actor, action, target_kind (enum: user/device/app/agent/plugin/settings/manifest), target_id (string — the target's username/slug at the time of the event; survives target deletion), payload (JSON), occurred_at. Indexed on `occurred_at` (for retention pruning) and `(target_kind, target_id)` (for "all events for kid1" queries). |
 | `manifests` | type (PK), version, sha256, url — versioned **agent** artifacts (plugins are not distributed this way; they're files on disk) |
 | `settings` | Single-row table (id=1 enforced). Operator-tunable runtime knobs (tick rates, retention windows). Initial migration creates the row with defaults; feature migrations add columns. See `## Configuration and settings`. |
 
@@ -81,7 +81,8 @@ The schema is created in the initial migration with all fields the system will e
 
 | Field | Why it matters |
 |-------|----------------|
-| `slug` | Stable identifier used in CLI/API/UI. Short URL-safe string (`kid1`), not a display name. |
+| `id` | INTEGER surrogate primary key. Stable across renames; FKs reference it. Not exposed in URLs (the public handle is `username`). |
+| `username` | Stable identifier used in CLI/API/UI. Short URL-safe string (`kid1`), not a display name. UNIQUE indexed. |
 | `role` | `member`, `manager`, or `admin`. Capabilities are cumulative: `member` has no operator powers; `manager` can lock/unlock any user with `managed: true` (including themselves and other managers); `admin` is everything `manager` is plus can edit users, devices, apps, plugin assignments, and agent manifests. Future auth/RBAC keys off this. |
 | `managed` | Bool, defaults to `true`. Whether lock rules apply to this user. Independent of `role` — a teen `manager` could be `managed: true` (has lock control over siblings *and* their own rules apply); a houseguest could be `member, managed: false` (no powers, not subject to rules). When `false`, `GET /v1/users/{user}/status` always returns `{locked: false, reasons: []}` and the rule pipeline is skipped. Operators typically opt out (`--managed false`) for adult managers and admins, and for guests; a teen `manager` who's also subject to rules stays `managed: true`. |
 
@@ -97,8 +98,9 @@ The kernel commits to none of the above; pick when the first non-kernel rule (li
 
 | Field | Why it matters |
 |-------|----------------|
-| `slug` | Used in CLI/UI and in API paths (`/v1/devices/gamingrig/...`). The agent installed on a device is identified by the device slug; there's no compound `<type>:<device>` identifier. |
-| `owner` | The user this device belongs to. For managed devices, also the user whose schedule/budget activity here debits. Null = shared device (governed as a group via the shared-device-lock feature when registered). |
+| `id` | INTEGER surrogate primary key. Stable across renames; FKs reference it. |
+| `slug` | Used in CLI/UI and in API paths (`/v1/devices/gamingrig/...`). The agent installed on a device is identified by the device slug; there's no compound `<type>:<device>` identifier. UNIQUE indexed. |
+| `owner_id` | The user this device belongs to (FK → `users.id`). For managed devices, also the user whose schedule/budget activity here debits. Null = shared device (governed as a group via the shared-device-lock feature when registered). |
 | `type` | `pc | phone | tablet | console | tv`. Laptops are `pc` — same OS-level enforcement (NTFS ACL, registry policy, process kill) applies regardless of form factor. Constrains which plugin types apply. |
 | `os` | `windows | macos | linux | ios | android`. Selects per-device plugin variants. |
 | `mac` | Network-layer identity, stable across IP changes. List, since a device commonly has multiple MACs (Wi-Fi + ethernet; randomized per network). Read by network-side plugins (e.g. `router-acl`) and by the Reachability monitoring feature for ARP probes. |
