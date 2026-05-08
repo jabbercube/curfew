@@ -3,58 +3,16 @@
 Covers: user create + read, user lock/unlock, status (locked/unlocked/missing/
 unmanaged), device status (404 + non-404 path), audit log writes.
 
-The test fixture spins up a fresh migrated SQLite per test, configures env to
-point at it, and registers the kernel rules so the lock pipeline is live.
+Shared ``configured_db`` / ``client`` / ``auth`` fixtures live in ``conftest.py``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from pathlib import Path
 
-import pytest
-from alembic import command
-from alembic.config import Config
-from curfew.config import reset_config_cache
-from curfew.db import reset_engine_cache
 from curfew.models import AuditLog, AuditTargetKind, Device, DeviceOS, DeviceType
-from curfew.rules import register_kernel_rules, user_scope
-from curfew_api.app import create_app
 from fastapi.testclient import TestClient
 from sqlmodel import Session, create_engine, select
-
-
-@pytest.fixture
-def configured_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    db = tmp_path / "test.sqlite"
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("CURFEW_ROOT_TOKEN", "test-token")
-    monkeypatch.setenv("CURFEW_DB_PATH", str(db))
-    reset_config_cache()
-    reset_engine_cache()
-
-    api_dir = Path(__file__).resolve().parents[1]
-    cfg = Config(str(api_dir / "alembic.ini"))
-    cfg.set_main_option("script_location", str(api_dir / "migrations"))
-    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
-    command.upgrade(cfg, "head")
-    register_kernel_rules()
-
-    yield db
-
-    user_scope.reset()
-    reset_config_cache()
-    reset_engine_cache()
-
-
-@pytest.fixture
-def client(configured_db: Path) -> TestClient:
-    return TestClient(create_app())
-
-
-@pytest.fixture
-def auth() -> dict[str, str]:
-    return {"Authorization": "Bearer test-token"}
 
 
 def _engine(db: Path):
