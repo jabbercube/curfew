@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
-from curfew.models import AuditLog, User, UserLock, UserRole
+from curfew.models import AuditLog, Device, DeviceOS, DeviceType, User, UserLock, UserRole
 from curfew.models import Settings as SettingsRow
 from curfew.plugin import Plugin, ReconcileResult, Scope
 from curfew.plugin_loader import PluginManifest, PluginRegistry, PluginType
@@ -172,6 +172,31 @@ def _seed_user(
         s.flush()
         if locked:
             s.add(UserLock(user_id=u.id, manual_lock=True))
+        s.commit()
+
+
+def _seed_device(
+    engine: Engine,
+    *,
+    owner: str,
+    slug: str,
+    mac: list[str],
+    type_: DeviceType = DeviceType.PC,
+    os_: DeviceOS = DeviceOS.WINDOWS,
+    managed: bool = True,
+) -> None:
+    with Session(engine) as s:
+        u = s.exec(select(User).where(User.username == owner)).one()
+        s.add(
+            Device(
+                slug=slug,
+                owner_id=u.id,
+                type=type_,
+                os=os_,
+                mac=mac,
+                managed=managed,
+            )
+        )
         s.commit()
 
 
@@ -402,6 +427,86 @@ def test_dispatch_wildcard_users(
 
     asyncio.run(go())
     assert len(_Recorder.calls) == 1
+
+
+def test_dispatch_populates_scope_devices(
+    runtime: PluginRuntime, engine: Engine, kernel_rules: None
+) -> None:
+    """``Scope.devices`` carries the user's devices, ordered by slug."""
+    _seed_user(engine, "kid1", locked=True)
+    _seed_device(engine, owner="kid1", slug="kid1-phone", mac=["aa:bb:cc:dd:ee:01"])
+    _seed_device(
+        engine,
+        owner="kid1",
+        slug="kid1-laptop",
+        mac=["aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"],
+        type_=DeviceType.PC,
+        os_=DeviceOS.WINDOWS,
+    )
+
+    async def go() -> None:
+        await runtime.register(
+            type_name="recorder",
+            instance_id="default",
+            instance=runtime.build_instance("recorder", {}),
+            config={},
+            users=["*"],
+        )
+        await runtime.dispatch_for_user("kid1")
+
+    asyncio.run(go())
+
+    scope = _Recorder.calls[0]
+    assert [d.slug for d in scope.devices] == ["kid1-laptop", "kid1-phone"]
+    laptop = scope.devices[0]
+    assert laptop.mac == ["aa:bb:cc:dd:ee:02", "aa:bb:cc:dd:ee:03"]
+    assert laptop.type == DeviceType.PC
+    assert laptop.os == DeviceOS.WINDOWS
+    assert laptop.managed is True
+
+
+def test_dispatch_devices_empty_when_user_has_none(
+    runtime: PluginRuntime, engine: Engine, kernel_rules: None
+) -> None:
+    _seed_user(engine, "kid1")
+
+    async def go() -> None:
+        await runtime.register(
+            type_name="recorder",
+            instance_id="default",
+            instance=runtime.build_instance("recorder", {}),
+            config={},
+            users=["*"],
+        )
+        await runtime.dispatch_for_user("kid1")
+
+    asyncio.run(go())
+
+    assert _Recorder.calls[0].devices == []
+
+
+def test_dispatch_devices_excludes_other_users(
+    runtime: PluginRuntime, engine: Engine, kernel_rules: None
+) -> None:
+    """A device owned by kid2 must not show up in kid1's scope."""
+    _seed_user(engine, "kid1")
+    _seed_user(engine, "kid2")
+    _seed_device(engine, owner="kid1", slug="kid1-pc", mac=["aa:bb:cc:dd:ee:01"])
+    _seed_device(engine, owner="kid2", slug="kid2-pc", mac=["aa:bb:cc:dd:ee:02"])
+
+    async def go() -> None:
+        await runtime.register(
+            type_name="recorder",
+            instance_id="default",
+            instance=runtime.build_instance("recorder", {}),
+            config={},
+            users=["*"],
+        )
+        await runtime.dispatch_for_user("kid1")
+
+    asyncio.run(go())
+
+    assert [d.slug for d in _Recorder.calls[0].devices] == ["kid1-pc"]
 
 
 def test_dispatch_skips_disabled(

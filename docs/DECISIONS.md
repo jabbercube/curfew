@@ -373,3 +373,39 @@ Each Python deliverable owns a `pyproject.toml`. The root `pyproject.toml` is a 
 - Static-export means the frontend deployment is just files: served by FastAPI itself (`StaticFiles` mount) or any static host. Simpler ops, but no edge SSR / dynamic-per-request serving — none of which V1 needs.
 - Members have no UI. If a member ever needs an "am I locked? why?" view, that's a separate audience and a separate slice (likely a tiny per-device kiosk page, not an extension of this admin app).
 
+## ADR-018: Plugin GUI extensions are schema-driven, not plugin-shipped JS
+
+**Decided (direction; not yet implemented):** when plugins eventually contribute to the operator UI, they do so by declaring *actions* (named methods returning typed result models) and *panels* (typed read-only data) in Python. The kernel exposes them at `POST /v1/plugins/{type}/{instance_id}/actions/{name}` and `GET /v1/plugins/{type}/{instance_id}/panels/{name}`. The SPA discovers what each plugin contributes via `GET /v1/plugins/types` and renders a generic plugin page per type — buttons for actions, tables / key-value lists for panels, all driven by the typed shapes. Plugin authors write zero JS / TSX.
+
+A first concrete sketch (illustrative, not a contract):
+
+```python
+class AdGuardPlugin(Plugin):
+    @plugin_action(label="Push devices to AdGuard")
+    async def push(self) -> PushResult: ...
+
+    @plugin_panel(label="Synced devices")
+    async def synced_devices(self) -> list[SyncedDeviceRow]: ...
+```
+
+**Status:** **not implemented.** The first crop of plugins (`adguard`, `smart-plug`, `router-acl`, `tailscale-acl`) ships headless — operators interact via API and CLI, lock state changes drive the plugins automatically. This ADR exists so the alternative (plugin-shipped JS bundles) doesn't accidentally creep in via the first plugin author who needs a button.
+
+**Rejected:**
+
+- **Plugin-shipped JS bundles** (Backstage / VS Code style). Most powerful, also most coupling: plugin authors have to learn the SPA's framework, redeploy when the SPA's framework changes, and the SPA has to sandbox third-party JS. For a homelab tool with a Python-only plugin audience, the cost dwarfs the benefit.
+- **Server-rendered HTML islands embedded in the SPA.** Inherits the worst of both worlds — plugins still ship templates / HTML, and the SPA still has to render them. Doesn't simplify anything.
+- **Going back to MPA / Jinja templates** (revisiting ADR-017's frontend choice). Doesn't actually fix the problem; even an MPA needs a contribution mechanism, and the answer would still look like schema-driven actions + panels. Throwing away the SPA to solve a plugin-extension problem is the wrong shape.
+- **No plugin UI at all, ever.** Reasonable for the kernel slice; not workable long-term once plugins have operator-relevant views (synced devices, last reconcile result, push/purge buttons).
+
+**Trade-offs accepted:**
+
+- Plugin authors are constrained to the widget set the SPA implements. Adding a new widget shape (chart, log tail, multi-select) requires coordinated kernel-SDK + SPA work. For the realistic plugin set the widget set is small (one table panel + a couple of buttons each), so this is a deliberate limit, not an oversight.
+- The kernel-SDK and SPA evolve together for plugin UI changes. Plugin authors get stability in exchange — once a panel/action shape exists, every plugin can use it without per-plugin SPA work.
+- The plugin-action surface adds a second method-dispatch axis to plugins beyond `reconcile`. Action implementations need to be careful about idempotency and timeouts the same way `reconcile` does — but the runtime can reuse the same audit + timeout machinery.
+
+**Why a kernel commitment now (the ADR, not the implementation):**
+
+- The first plugin (`adguard`) ships headless. The first operator request after that will be "can I have a push button?" — and the temptation to just ship a JS file from the plugin is real. This ADR prevents that path from being taken in a hurry.
+- Smart-plug, router-acl, and tailscale-acl all want similar UI shapes (a table of governed devices, a button or two). Picking schema-driven now means the contribution shape is uniform across them when the implementation lands.
+- The decision is independent of when the implementation happens. Capturing it as an ADR is cheap; capturing it after three plugins have each invented their own UI is expensive.
+

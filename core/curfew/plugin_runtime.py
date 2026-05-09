@@ -35,9 +35,9 @@ from sqlalchemy import Engine
 from sqlmodel import Session, select
 
 from curfew.audit import record_audit
-from curfew.models import AuditTargetKind, User
+from curfew.models import AuditTargetKind, Device, User
 from curfew.models import Settings as SettingsRow
-from curfew.plugin import Plugin, ReconcileResult, Scope
+from curfew.plugin import DeviceRef, Plugin, ReconcileResult, Scope
 from curfew.plugin_loader import PluginRegistry
 from curfew.rules import user_scope
 
@@ -222,7 +222,13 @@ class PluginRuntime:
 
         with self._session() as session:
             status = user_scope.evaluate(session, username)
-        scope = Scope(user=username, locked=status.locked, reasons=list(status.reasons))
+            devices = self._load_devices(session, username)
+        scope = Scope(
+            user=username,
+            locked=status.locked,
+            reasons=list(status.reasons),
+            devices=devices,
+        )
 
         await asyncio.gather(*[self._run_one(live, scope) for live in governing])
 
@@ -256,6 +262,31 @@ class PluginRuntime:
     @staticmethod
     def _governs(live: AssignedInstance, username: str) -> bool:
         return "*" in live.users or username in live.users
+
+    @staticmethod
+    def _load_devices(session: Session, username: str) -> list[DeviceRef]:
+        """Return ``DeviceRef``s for the user's devices, ordered by slug.
+
+        Empty list when the user has none, or when the user row is gone
+        (the dispatch was scheduled before a delete; reconcile becomes a
+        no-op-on-empty-devices for that user).
+        """
+        user = session.exec(select(User).where(User.username == username)).first()
+        if user is None or user.id is None:
+            return []
+        rows = session.exec(
+            select(Device).where(Device.owner_id == user.id).order_by(Device.slug)
+        ).all()
+        return [
+            DeviceRef(
+                slug=d.slug,
+                type=d.type,
+                os=d.os,
+                mac=list(d.mac),
+                managed=d.managed,
+            )
+            for d in rows
+        ]
 
     async def _run_one(self, live: AssignedInstance, scope: Scope) -> None:
         """Call one plugin's ``reconcile`` with a timeout; audit failures."""
