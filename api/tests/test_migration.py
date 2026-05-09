@@ -32,8 +32,17 @@ EXPECTED_TABLES = {
 
 
 @pytest.fixture
-def migrated_db(tmp_path: Path) -> Iterator[str]:
-    """Apply alembic upgrade head against a fresh temp SQLite file."""
+def migrated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """Apply alembic upgrade head against a fresh temp SQLite file.
+
+    Drops ``CURFEW_DB_PATH`` from the env first: ``api/migrations/env.py``
+    honours that var and would otherwise override the test's ``cfg`` to
+    point at whatever the operator's shell / justfile pinned it to,
+    silently making every assertion query the wrong DB. This used to
+    surface as flaky failures whenever ``just test`` ran (the justfile
+    pins ``CURFEW_DB_PATH`` for ``just serve``/``migrate``).
+    """
+    monkeypatch.delenv("CURFEW_DB_PATH", raising=False)
     db = tmp_path / "test.sqlite"
     api_dir = Path(__file__).resolve().parents[1]
     cfg = Config(str(api_dir / "alembic.ini"))
@@ -138,8 +147,9 @@ def test_agent_tokens_id_is_integer_pk(migrated_db: str) -> None:
     assert cols["id"]["type"].__class__.__name__ == "INTEGER"
 
 
-def test_downgrade_drops_all_tables(tmp_path: Path) -> None:
+def test_downgrade_drops_all_tables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """upgrade head → downgrade base leaves only alembic_version."""
+    monkeypatch.delenv("CURFEW_DB_PATH", raising=False)
     db = tmp_path / "test.sqlite"
     api_dir = Path(__file__).resolve().parents[1]
     cfg = Config(str(api_dir / "alembic.ini"))

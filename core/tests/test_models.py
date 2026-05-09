@@ -21,7 +21,7 @@ from curfew.models import (
     DeviceOS,
     DeviceType,
     Manifest,
-    Plugin,
+    PluginAssignment,
     Settings,
     User,
     UserLock,
@@ -153,13 +153,13 @@ def test_agent_token_unique_hash(session: Session) -> None:
         session.commit()
 
 
-def test_plugin_composite_pk(session: Session) -> None:
-    session.add(Plugin(type="adguard", config={"url": "x"}, users=["*"]))
-    session.add(Plugin(type="smart_plug", instance_id="livingroom", users=["kid1"]))
-    session.add(Plugin(type="smart_plug", instance_id="bedroom", users=["kid2"]))
+def test_plugin_assignment_composite_pk(session: Session) -> None:
+    session.add(PluginAssignment(type="adguard", config={"url": "x"}, users=["*"]))
+    session.add(PluginAssignment(type="smart_plug", instance_id="livingroom", users=["kid1"]))
+    session.add(PluginAssignment(type="smart_plug", instance_id="bedroom", users=["kid2"]))
     session.commit()
 
-    rows = session.exec(select(Plugin)).all()
+    rows = session.exec(select(PluginAssignment)).all()
     assert {(r.type, r.instance_id) for r in rows} == {
         ("adguard", "default"),
         ("smart_plug", "livingroom"),

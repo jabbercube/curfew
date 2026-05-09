@@ -182,7 +182,18 @@ class AgentToken(SQLModel, table=True):
     revoked_at: datetime | None = Field(default=None, sa_column=Column(UTCDateTime))
 
 
-class Plugin(SQLModel, table=True):
+class PluginAssignment(SQLModel, table=True):
+    """Operator's assignment of a plugin type to a set of users.
+
+    The class name is ``PluginAssignment`` (not ``Plugin``) because plugin
+    authors import ``Plugin`` from ``curfew.plugin`` as the SDK base class.
+    A row in this table represents the operator's *assignment* — config,
+    governed users, paused flag — for one (type, instance_id). The
+    in-memory plugin object instantiated from that row is the *instance*.
+    The table name stays ``plugins`` to keep API/CLI URLs natural
+    (``/v1/plugins``, ``curfew plugin assign ...``).
+    """
+
     __tablename__ = "plugins"
 
     type: str = Field(primary_key=True)

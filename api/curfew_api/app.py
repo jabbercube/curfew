@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from curfew.config import get_config
+from curfew.plugin_loader import discover_plugins
 from curfew.rules import register_kernel_rules
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +23,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
-from curfew_api.routes import apps, auth, devices, health, locks, status, system, users
+from curfew_api.routes import apps, auth, devices, health, locks, plugins, status, system, users
 from curfew_api.routes.settings import router as settings_router
 
 
@@ -57,6 +58,13 @@ def create_app() -> FastAPI:
         openapi_url="/v1/openapi.json",
     )
 
+    # Discover plugins once at startup. The registry is read-only at
+    # runtime; adding a new plugin folder requires a restart (ADR-013).
+    # ``discover_plugins`` is robust to missing dirs and per-plugin
+    # errors, so a misconfigured ``CURFEW_PLUGINS_DIRS`` doesn't stop
+    # startup — bad plugins surface at ``GET /v1/plugins/types``.
+    app.state.plugin_registry = discover_plugins(config.plugins_dirs)
+
     if config.cors_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -72,6 +80,7 @@ def create_app() -> FastAPI:
     app.include_router(devices.router)
     app.include_router(apps.router)
     app.include_router(locks.router)
+    app.include_router(plugins.router)
     app.include_router(status.router)
     app.include_router(settings_router)
     app.include_router(system.router)

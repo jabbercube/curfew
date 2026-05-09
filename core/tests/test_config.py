@@ -39,6 +39,10 @@ def test_defaults_apply_when_only_token_set(
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CURFEW_ROOT_TOKEN", "abc")
+    # Strip any inherited CURFEW_* env so the assertion really exercises
+    # built-in defaults — the justfile pins CURFEW_DB_PATH for `just
+    # serve`/`migrate`, which would otherwise leak into this test.
+    monkeypatch.delenv("CURFEW_DB_PATH", raising=False)
     s = Settings()
     assert s.db_path == "state.sqlite"
     assert s.listen_port == 8000
