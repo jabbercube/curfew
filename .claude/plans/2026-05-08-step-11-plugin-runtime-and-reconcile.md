@@ -17,20 +17,20 @@ PLAN.md §"Plugin lifecycle" + ADR-005 + PLUGINS.md §"Lifecycle" are the load-b
 
 **In:**
 
-- `core/curfew/plugin_runtime.py` — new. The in-memory instance manager. Holds `{(type, instance_id): _Live}` where `_Live` carries the instantiated `Plugin`, the resolved governed-users list, and the paused flag. Mutations (`assign`, `unassign`, `update`, `set_paused`) are guarded by an `asyncio.Lock`. `dispatch_for_user(username)` finds every governing instance and schedules `_run_one_reconcile` for each. `_run_one_reconcile` wraps the plugin's `reconcile()` in `asyncio.wait_for(..., timeout=plugin_reconcile_timeout_seconds)` and audits failures (timeout, exception, error result). `safety_net_resync()` walks every governed user and dispatches.
-- `core/curfew/schemas.py` — `PluginAssignmentRead`, `PluginAssignmentCreate` (`type`, optional `instance_id` defaulting to `"default"`, `config: dict`, `users: list[str]`), `PluginAssignmentUpdate` (all-optional: `config`, `users`, `paused`).
+- `core/curfew/plugin_runtime.py` — new. The in-memory instance manager. Holds `{(type, instance_id): _Live}` where `_Live` carries the instantiated `Plugin`, the resolved governed-users list, and the enabled flag. Mutations (`assign`, `unassign`, `update`, `set_enabled`) are guarded by an `asyncio.Lock`. `dispatch_for_user(username)` finds every governing instance and schedules `_run_one_reconcile` for each. `_run_one_reconcile` wraps the plugin's `reconcile()` in `asyncio.wait_for(..., timeout=plugin_reconcile_timeout_seconds)` and audits failures (timeout, exception, error result). `safety_net_resync()` walks every governed user and dispatches.
+- `core/curfew/schemas.py` — `PluginAssignmentRead`, `PluginAssignmentCreate` (`type`, optional `instance_id` defaulting to `"default"`, `config: dict`, `users: list[str]`), `PluginAssignmentUpdate` (all-optional: `config`, `users`, `enabled`).
 - `core/curfew/__init__.py` — re-export `PluginRuntime`, the new schemas.
 - `api/curfew_api/routes/plugins.py` — extend with the four CRUD verbs:
-  - `GET /v1/plugins` — list assignments + paused/users (operator).
+  - `GET /v1/plugins` — list assignments + enabled/users (operator).
   - `POST /v1/plugins` — assign. Validates the discovered type exists + config matches its Pydantic schema; inserts the row; instantiates via the runtime. 422 on bad config, 404 on unknown type, 409 on duplicate `(type, instance_id)`. Admin only.
-  - `PATCH /v1/plugins/{type}/{instance_id}` — partial update. If `config` changes, re-instantiate (PLAN.md option 1). If `users` changes, update the governed-users cache. If `paused` changes, flip the flag. Admin only.
+  - `PATCH /v1/plugins/{type}/{instance_id}` — partial update. If `config` changes, re-instantiate (PLAN.md option 1). If `users` changes, update the governed-users cache. If `enabled` changes, flip the flag. Admin only.
   - `DELETE /v1/plugins/{type}/{instance_id}` — unassign. Drops from runtime. Admin only.
 - `api/curfew_api/routes/locks.py` — after the lock/unlock commit, schedule `runtime.dispatch_for_user(username)` via FastAPI `BackgroundTasks`. The originating HTTP response returns immediately; reconciles run after.
 - `api/curfew_api/app.py` — switch to FastAPI lifespan context manager. At startup: build the runtime, load every existing `plugin_assignments` row into memory, start an `asyncio` task that loops every `plugin_resync_seconds` (read fresh on each iteration so settings PATCHes take effect) and calls `runtime.safety_net_resync()`. At shutdown: cancel the task cleanly.
 - `plugins/reftest-plugin/plugin.py` — replace the no-op reconcile with sentinel logic. `Config` gains `sentinel_path: str`. Locked → write the user's name to that path; unlocked → remove the file (idempotent if already absent). Used by the e2e test to assert reconcile actually ran.
-- `core/tests/test_plugin_runtime.py` — new. Assign/unassign mutate the in-memory map. PATCH on `config` re-instantiates (assert `__init__` ran twice). PATCH on `users` rewires governance. PATCH on `paused` skips dispatch. `dispatch_for_user` picks instances whose `users` list contains the username or `["*"]`. Paused instances skipped. Timeout cancels the call and audits a `plugin.reconcile_failed`. An exception in `reconcile` is caught + audited but doesn't propagate. `safety_net_resync` calls reconcile for every governed user × every governing plugin.
-- `api/tests/test_plugins_assignments.py` — new. CRUD endpoints: list (empty + populated), create (happy + 422 bad config + 404 unknown type + 409 duplicate), patch (single field, multi-field, paused toggle), delete (200 + 404). Audit rows. Auth: 401 unauth, 403 manager.
-- `api/tests/test_plugins_reconcile.py` — new. e2e: configure `CURFEW_PLUGINS_DIRS` at the repo's `plugins/`; assign reftest_plugin with `sentinel_path=<tmp>/sentinel`; lock kid1 → wait for reconcile → assert sentinel exists with `kid1` content; unlock → assert removed. Same flow but kill the lock-triggered reconcile (paused at the moment of lock); safety-net resync picks it up on its next tick. Failed reconcile (point sentinel_path at an unwritable dir) → next lock toggle still returns 200; audit shows `plugin.reconcile_failed`.
+- `core/tests/test_plugin_runtime.py` — new. Assign/unassign mutate the in-memory map. PATCH on `config` re-instantiates (assert `__init__` ran twice). PATCH on `users` rewires governance. PATCH on `enabled` skips dispatch. `dispatch_for_user` picks instances whose `users` list contains the username or `["*"]`. Disabled instances skipped. Timeout cancels the call and audits a `plugin.reconcile_failed`. An exception in `reconcile` is caught + audited but doesn't propagate. `safety_net_resync` calls reconcile for every governed user × every governing plugin.
+- `api/tests/test_plugins_assignments.py` — new. CRUD endpoints: list (empty + populated), create (happy + 422 bad config + 404 unknown type + 409 duplicate), patch (single field, multi-field, enabled toggle), delete (200 + 404). Audit rows. Auth: 401 unauth, 403 manager.
+- `api/tests/test_plugins_reconcile.py` — new. e2e: configure `CURFEW_PLUGINS_DIRS` at the repo's `plugins/`; assign reftest_plugin with `sentinel_path=<tmp>/sentinel`; lock kid1 → wait for reconcile → assert sentinel exists with `kid1` content; unlock → assert removed. Same flow but kill the lock-triggered reconcile (disabled at the moment of lock); safety-net resync picks it up on its next tick. Failed reconcile (point sentinel_path at an unwritable dir) → next lock toggle still returns 200; audit shows `plugin.reconcile_failed`.
 
 **Out (next slice — beyond the kernel):**
 
@@ -41,7 +41,7 @@ PLAN.md §"Plugin lifecycle" + ADR-005 + PLUGINS.md §"Lifecycle" are the load-b
 
 ## Notable design choices
 
-- **Re-instantiate on config PATCH (PLAN.md option 1).** Cleanest semantics for the operator: PATCH is "give me this plugin running with this config." Plugin authors can keep `__init__` cheap (or expensive — their call) and don't need to remember to re-read config inside `reconcile`. `users` and `paused` changes don't re-instantiate.
+- **Re-instantiate on config PATCH (PLAN.md option 1).** Cleanest semantics for the operator: PATCH is "give me this plugin running with this config." Plugin authors can keep `__init__` cheap (or expensive — their call) and don't need to remember to re-read config inside `reconcile`. `users` and `enabled` changes don't re-instantiate.
 - **`asyncio.Lock` for runtime mutations.** Two operators submitting concurrent assigns on the same `(type, instance_id)` lose to the DB unique constraint anyway, but the lock keeps the in-memory map consistent during the brief window between insert + instantiate. Cheap at homelab scale.
 - **Reconcile dispatch via `BackgroundTasks`, not bare `asyncio.create_task`.** FastAPI runs background tasks after the response is sent, with built-in error containment. `create_task` would work but loses the framework hook (and tests would have to await the task explicitly).
 - **Per-call timeout via `asyncio.wait_for`.** Cancels a hung plugin's coroutine and treats it as a failure. Plugins can still hang the entire event loop if they do blocking IO without `await` — that's a class of bug the plugin author has to avoid (called out in PLUGINS.md).
@@ -82,7 +82,7 @@ PLAN.md §"Plugin lifecycle" + ADR-005 + PLUGINS.md §"Lifecycle" are the load-b
   - `just serve`, then `curl -X POST -H 'Authorization: Bearer ...' -H 'Content-Type: application/json' -d '{"type":"reftest_plugin","config":{"sentinel_path":"/tmp/sent"},"users":["*"]}' :8000/v1/plugins`.
   - `just user-create kid1 kid12345 member` then lock kid1; `/tmp/sent` appears with content `kid1`.
   - Unlock; `/tmp/sent` disappears.
-  - Pause the plugin (`PATCH ... '{"paused": true}'`); lock again; sentinel does *not* appear.
+  - Disable the plugin (`PATCH ... '{"enabled": false}'`); lock again; sentinel does *not* appear.
 
 ## Branch + PR
 

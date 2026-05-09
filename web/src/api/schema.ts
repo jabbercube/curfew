@@ -234,6 +234,81 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/plugins/types": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Plugin Types
+         * @description List discovered plugin types from ``CURFEW_PLUGINS_DIRS``.
+         *
+         *     Reads from the registry built once at startup. Adding or removing a
+         *     plugin folder requires a curfew-core restart (per ADR-013); this
+         *     endpoint just reports what was discovered.
+         */
+        get: operations["list_plugin_types_v1_plugins_types_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/plugins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Assignments */
+        get: operations["list_assignments_v1_plugins_get"];
+        put?: never;
+        /**
+         * Create Assignment
+         * @description Assign a plugin to a set of users.
+         *
+         *     Validates the type exists (404), the config matches the type's Pydantic
+         *     schema (422), and the ``(type, instance_id)`` is unique (409). Builds
+         *     the live instance *before* writing the DB row so a bad config / broken
+         *     plugin returns 422 / 500 without leaving an orphan row behind.
+         */
+        post: operations["create_assignment_v1_plugins_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/plugins/{type_name}/{instance_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Assignment */
+        delete: operations["delete_assignment_v1_plugins__type_name___instance_id__delete"];
+        options?: never;
+        head?: never;
+        /**
+         * Update Assignment
+         * @description Partial update.
+         *
+         *     If ``config`` changes, the runtime re-instantiates the plugin
+         *     (PLAN.md option 1). ``users`` and ``enabled`` updates don't touch
+         *     ``__init__``.
+         */
+        patch: operations["update_assignment_v1_plugins__type_name___instance_id__patch"];
+        trace?: never;
+    };
     "/v1/users/{user}/status": {
         parameters: {
             query?: never;
@@ -476,6 +551,61 @@ export interface components {
             username: string | null;
             role: components["schemas"]["UserRole"];
         };
+        /**
+         * PluginAssignmentCreate
+         * @description ``POST /v1/plugins`` body. ``instance_id`` defaults to ``"default"``.
+         */
+        PluginAssignmentCreate: {
+            /** Type */
+            type: string;
+            /**
+             * Instance Id
+             * @default default
+             */
+            instance_id: string;
+            /** Config */
+            config?: {
+                [key: string]: unknown;
+            };
+            /** Users */
+            users?: string[];
+        };
+        /**
+         * PluginAssignmentRead
+         * @description One assigned plugin instance — what ``GET /v1/plugins`` returns.
+         *
+         *     Mirrors the ``plugin_assignments`` row + the in-memory enabled flag.
+         *     Doesn't surface the live ``Plugin`` instance object; that's a runtime
+         *     concern, not part of the API contract.
+         */
+        PluginAssignmentRead: {
+            /** Type */
+            type: string;
+            /** Instance Id */
+            instance_id: string;
+            /** Config */
+            config: {
+                [key: string]: unknown;
+            };
+            /** Users */
+            users: string[];
+            /** Enabled */
+            enabled: boolean;
+        };
+        /**
+         * PluginAssignmentUpdate
+         * @description ``PATCH /v1/plugins/{type}/{instance_id}`` body. All-optional.
+         */
+        PluginAssignmentUpdate: {
+            /** Config */
+            config?: {
+                [key: string]: unknown;
+            } | null;
+            /** Users */
+            users?: string[] | null;
+            /** Enabled */
+            enabled?: boolean | null;
+        };
         /** PluginSnapshotRow */
         PluginSnapshotRow: {
             /** Type */
@@ -484,8 +614,36 @@ export interface components {
             instance_id: string;
             /** Users */
             users: string[];
-            /** Paused */
-            paused: boolean;
+            /** Enabled */
+            enabled: boolean;
+        };
+        /**
+         * PluginTypeRead
+         * @description One discovered plugin type as returned by ``GET /v1/plugins/types``.
+         *
+         *     Reflects what the loader found at startup. ``error`` is non-null when
+         *     the plugin folder failed to load (missing manifest, no Plugin subclass,
+         *     bad imports, etc.); successfully-loaded plugins have ``error: null``
+         *     and the manifest fields populated.
+         */
+        PluginTypeRead: {
+            /** Type */
+            type: string;
+            /** Name */
+            name?: string | null;
+            /** Version */
+            version?: string | null;
+            /** Description */
+            description?: string | null;
+            /** Config Schema */
+            config_schema?: string | null;
+            /** Error */
+            error?: string | null;
+            /**
+             * Has Requirements Txt
+             * @default false
+             */
+            has_requirements_txt: boolean;
         };
         /**
          * Reason
@@ -1252,6 +1410,145 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["LockStatus"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_plugin_types_v1_plugins_types_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginTypeRead"][];
+                };
+            };
+        };
+    };
+    list_assignments_v1_plugins_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginAssignmentRead"][];
+                };
+            };
+        };
+    };
+    create_assignment_v1_plugins_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PluginAssignmentCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginAssignmentRead"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_assignment_v1_plugins__type_name___instance_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                type_name: string;
+                instance_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_assignment_v1_plugins__type_name___instance_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                type_name: string;
+                instance_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PluginAssignmentUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PluginAssignmentRead"];
                 };
             };
             /** @description Validation Error */

@@ -199,7 +199,7 @@ class AgentSnapshotRow(BaseModel):
 class PluginAssignmentRead(BaseModel):
     """One assigned plugin instance — what ``GET /v1/plugins`` returns.
 
-    Mirrors the ``plugin_assignments`` row + the in-memory paused flag.
+    Mirrors the ``plugin_assignments`` row + the in-memory enabled flag.
     Doesn't surface the live ``Plugin`` instance object; that's a runtime
     concern, not part of the API contract.
     """
@@ -210,7 +210,7 @@ class PluginAssignmentRead(BaseModel):
     instance_id: str
     config: dict[str, object]
     users: list[str]
-    paused: bool
+    enabled: bool
 
 
 class PluginAssignmentCreate(BaseModel):
@@ -227,7 +227,7 @@ class PluginAssignmentUpdate(BaseModel):
 
     config: dict[str, object] | None = None
     users: list[str] | None = None
-    paused: bool | None = None
+    enabled: bool | None = None
 
 
 class PluginTypeRead(BaseModel):
@@ -254,7 +254,7 @@ class PluginSnapshotRow(BaseModel):
     type: str
     instance_id: str
     users: list[str]
-    paused: bool
+    enabled: bool
 
 
 class UserLockSnapshotRow(BaseModel):

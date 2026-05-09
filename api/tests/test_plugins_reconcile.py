@@ -24,7 +24,7 @@ def _engine(db: Path):  # type: ignore[no-untyped-def]
 
 
 def _setup_kid_and_plugin(
-    client: TestClient, auth: dict[str, str], sentinel: Path, *, paused: bool = False
+    client: TestClient, auth: dict[str, str], sentinel: Path, *, enabled: bool = True
 ) -> None:
     """Seed: one managed kid + one reftest_plugin assignment governing them."""
     r = client.post(
@@ -43,10 +43,10 @@ def _setup_kid_and_plugin(
         headers=auth,
     )
     assert r.status_code == 201, r.text
-    if paused:
+    if not enabled:
         r = client.patch(
             "/v1/plugins/reftest_plugin/default",
-            json={"paused": True},
+            json={"enabled": False},
             headers=auth,
         )
         assert r.status_code == 200
@@ -77,11 +77,11 @@ def test_unlock_clears_sentinel(
     assert not sentinel.exists()
 
 
-def test_paused_plugin_doesnt_reconcile(
+def test_disabled_plugin_doesnt_reconcile(
     client_with_repo_plugins: TestClient, auth: dict[str, str], tmp_path: Path
 ) -> None:
     sentinel = tmp_path / "sentinel"
-    _setup_kid_and_plugin(client_with_repo_plugins, auth, sentinel, paused=True)
+    _setup_kid_and_plugin(client_with_repo_plugins, auth, sentinel, enabled=False)
 
     r = client_with_repo_plugins.post("/v1/users/kid1/lock", headers=auth)
     assert r.status_code == 200
@@ -91,25 +91,25 @@ def test_paused_plugin_doesnt_reconcile(
 def test_safety_net_picks_up_missed_lock(
     client_with_repo_plugins: TestClient, auth: dict[str, str], tmp_path: Path
 ) -> None:
-    """If a lock fires while the plugin is paused, unpausing + resync writes the sentinel.
+    """If a lock fires while the plugin is disabled, re-enabling + resync writes the sentinel.
 
     Simulates the production case where curfew-core restarted between a
     ``lock`` and the plugin's reconcile firing — the safety-net loop is
     meant to catch this.
     """
     sentinel = tmp_path / "sentinel"
-    _setup_kid_and_plugin(client_with_repo_plugins, auth, sentinel, paused=True)
+    _setup_kid_and_plugin(client_with_repo_plugins, auth, sentinel, enabled=False)
 
-    # Lock while paused: nothing reconciles.
+    # Lock while disabled: nothing reconciles.
     client_with_repo_plugins.post("/v1/users/kid1/lock", headers=auth)
     assert not sentinel.exists()
 
-    # Unpause + manually trigger the safety-net path. (In production the
-    # background loop fires every plugin_resync_seconds; we don't sleep
-    # 300s for a test, we invoke it directly.)
+    # Re-enable + manually trigger the safety-net path. (In production
+    # the background loop fires every plugin_resync_seconds; we don't
+    # sleep 300s for a test, we invoke it directly.)
     r = client_with_repo_plugins.patch(
         "/v1/plugins/reftest_plugin/default",
-        json={"paused": False},
+        json={"enabled": True},
         headers=auth,
     )
     assert r.status_code == 200

@@ -84,7 +84,7 @@ def _row_to_read(row: PluginAssignment) -> PluginAssignmentRead:
         instance_id=row.instance_id,
         config=dict(row.config),
         users=list(row.users),
-        paused=row.paused,
+        enabled=row.enabled,
     )
 
 
@@ -154,7 +154,7 @@ async def create_assignment(
         instance_id=payload.instance_id,
         config=dict(payload.config),
         users=list(payload.users),
-        paused=False,
+        enabled=True,
     )
     session.add(row)
     try:
@@ -183,7 +183,7 @@ async def create_assignment(
             instance=instance,
             config=dict(row.config),
             users=list(row.users),
-            paused=row.paused,
+            enabled=row.enabled,
         )
     except AlreadyAssignedError:
         # Race: a concurrent request beat us to the runtime register call.
@@ -206,7 +206,7 @@ async def update_assignment(
     """Partial update.
 
     If ``config`` changes, the runtime re-instantiates the plugin
-    (PLAN.md option 1). ``users`` and ``paused`` updates don't touch
+    (PLAN.md option 1). ``users`` and ``enabled`` updates don't touch
     ``__init__``.
     """
     runtime = _runtime(request)
@@ -224,7 +224,7 @@ async def update_assignment(
             instance_id=instance_id,
             config=update_data.get("config"),
             users=update_data.get("users"),
-            paused=update_data.get("paused"),
+            enabled=update_data.get("enabled"),
         )
     except NotAssignedError:
         # Runtime out of sync with DB — should never happen for a row that
@@ -250,8 +250,8 @@ async def update_assignment(
         row.config = dict(update_data["config"])
     if "users" in update_data:
         row.users = list(update_data["users"])
-    if "paused" in update_data:
-        row.paused = bool(update_data["paused"])
+    if "enabled" in update_data:
+        row.enabled = bool(update_data["enabled"])
     session.add(row)
     record_audit(
         session,

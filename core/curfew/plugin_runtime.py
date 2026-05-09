@@ -75,7 +75,7 @@ class AssignedInstance:
     instance: Plugin
     config: dict[str, Any]
     users: list[str]
-    paused: bool
+    enabled: bool
 
 
 class PluginRuntime:
@@ -143,7 +143,7 @@ class PluginRuntime:
         instance: Plugin,
         config: dict[str, Any],
         users: list[str],
-        paused: bool = False,
+        enabled: bool = True,
     ) -> AssignedInstance:
         """Register a pre-built ``Plugin`` instance.
 
@@ -163,7 +163,7 @@ class PluginRuntime:
                 instance=instance,
                 config=config,
                 users=list(users),
-                paused=paused,
+                enabled=enabled,
             )
             self._instances[key] = live
             return live
@@ -180,7 +180,7 @@ class PluginRuntime:
         instance_id: str,
         config: dict[str, Any] | None = None,
         users: list[str] | None = None,
-        paused: bool | None = None,
+        enabled: bool | None = None,
     ) -> AssignedInstance:
         """Mutate one or more fields. Re-instantiates iff ``config`` changed."""
         async with self._lock:
@@ -196,8 +196,8 @@ class PluginRuntime:
                 live = replace(live, instance=new_instance, config=config)
             if users is not None:
                 live = replace(live, users=list(users))
-            if paused is not None:
-                live = replace(live, paused=paused)
+            if enabled is not None:
+                live = replace(live, enabled=enabled)
 
             self._instances[key] = live
             return live
@@ -215,7 +215,7 @@ class PluginRuntime:
         governing = [
             live
             for live in self._instances.values()
-            if not live.paused and self._governs(live, username)
+            if live.enabled and self._governs(live, username)
         ]
         if not governing:
             return

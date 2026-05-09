@@ -188,7 +188,7 @@ class PluginAssignment(SQLModel, table=True):
     The class name is ``PluginAssignment`` (not ``Plugin``) because plugin
     authors import ``Plugin`` from ``curfew.plugin`` as the SDK base class.
     A row in this table represents the operator's *assignment* — config,
-    governed users, paused flag — for one (type, instance_id). The
+    governed users, enabled flag — for one (type, instance_id). The
     in-memory plugin object instantiated from that row is the *instance*.
     The table name stays ``plugins`` to keep API/CLI URLs natural
     (``/v1/plugins``, ``curfew plugin assign ...``).
@@ -200,7 +200,7 @@ class PluginAssignment(SQLModel, table=True):
     instance_id: str = Field(default="default", primary_key=True)
     config: dict[str, Any] = Field(default_factory=dict, sa_column=Column(JSON, nullable=False))
     users: list[str] = Field(default_factory=list, sa_column=Column(JSON, nullable=False))
-    paused: bool = Field(default=False)
+    enabled: bool = Field(default=True)
 
 
 class UserLock(SQLModel, table=True):
