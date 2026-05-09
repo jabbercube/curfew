@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 from curfew.audit import record_audit
@@ -9,7 +10,7 @@ from curfew.db import get_session
 from curfew.models import AuditTargetKind, Device, User, UserLock
 from curfew.passwords import hash_password
 from curfew.schemas import UserCreate, UserRead, UserUpdate
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
@@ -81,6 +82,8 @@ def update_user(
     user: str,
     payload: UserUpdate,
     actor: RequireAdmin,
+    background_tasks: BackgroundTasks,
+    request: Request,
     session: Annotated[Session, Depends(get_session)],
 ) -> User:
     row = _get_user_or_404(session, user)
@@ -89,6 +92,34 @@ def update_user(
         return row  # nothing to update; idempotent no-op
 
     original_username = row.username
+
+    # Invariant: unmanaged users are never locked at the DB level. If the
+    # PATCH flips ``managed`` to false on a currently-locked user, clear
+    # the lock first so the audit trail reads ``user.unlock`` then
+    # ``user.update`` (semantic "we unlocked them as part of unmanaging
+    # them"), and schedule a plugin reconcile so any external state
+    # (smart plug, DNS sinkhole, etc.) clears too. The opposite direction
+    # (``managed=true`` on an unmanaged user) is left untouched on
+    # purpose — the operator chose to manage them; we don't auto-lock.
+    schedule_unlock_reconcile = False
+    if update_data.get("managed") is False:
+        lock = session.exec(select(UserLock).where(UserLock.user_id == row.id)).first()
+        if lock is not None and lock.manual_lock:
+            lock.manual_lock = False
+            lock.set_at = datetime.now(UTC)
+            lock.set_by = actor.audit_str
+            session.add(lock)
+            session.flush()
+            record_audit(
+                session,
+                actor=actor,
+                action="user.unlock",
+                target_kind=AuditTargetKind.USER,
+                target_id=original_username,
+                payload={"reason": "managed_to_unmanaged"},
+            )
+            schedule_unlock_reconcile = True
+
     for field, value in update_data.items():
         setattr(row, field, value)
     session.add(row)
@@ -111,6 +142,15 @@ def update_user(
     )
     session.commit()
     session.refresh(row)
+
+    if schedule_unlock_reconcile:
+        # Fire after the response so the operator's PATCH doesn't wait on
+        # plugins. The runtime reads the post-commit state — user is now
+        # ``managed=false, manual_lock=false``; the rule pipeline returns
+        # ``locked=false`` and plugins reconcile to the unlocked state
+        # before treating this user as out-of-scope.
+        background_tasks.add_task(request.app.state.plugin_runtime.dispatch_for_user, row.username)
+
     return row
 
 
