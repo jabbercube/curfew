@@ -44,12 +44,13 @@ def configured_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[P
 
 
 @pytest.fixture
-def client(configured_db: Path) -> TestClient:
-    return TestClient(create_app())
+def client(configured_db: Path) -> Iterator[TestClient]:
+    with TestClient(create_app()) as c:
+        yield c
 
 
 @pytest.fixture
-def client_with_protected_stub(configured_db: Path) -> TestClient:
+def client_with_protected_stub(configured_db: Path) -> Iterator[TestClient]:
     """An app with an extra ``/v1/_stub`` route gated by ``Operator``."""
     app = create_app()
     stub = APIRouter()
@@ -59,7 +60,8 @@ def client_with_protected_stub(configured_db: Path) -> TestClient:
         return {"actor": actor.audit_str}
 
     app.include_router(stub)
-    return TestClient(app)
+    with TestClient(app) as c:
+        yield c
 
 
 def test_health_unauthenticated(client: TestClient) -> None:

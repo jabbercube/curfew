@@ -196,6 +196,40 @@ class AgentSnapshotRow(BaseModel):
     last_seen_version: str | None
 
 
+class PluginAssignmentRead(BaseModel):
+    """One assigned plugin instance — what ``GET /v1/plugins`` returns.
+
+    Mirrors the ``plugin_assignments`` row + the in-memory paused flag.
+    Doesn't surface the live ``Plugin`` instance object; that's a runtime
+    concern, not part of the API contract.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    type: str
+    instance_id: str
+    config: dict[str, object]
+    users: list[str]
+    paused: bool
+
+
+class PluginAssignmentCreate(BaseModel):
+    """``POST /v1/plugins`` body. ``instance_id`` defaults to ``"default"``."""
+
+    type: str
+    instance_id: str = "default"
+    config: dict[str, object] = Field(default_factory=dict)
+    users: list[str] = Field(default_factory=list)
+
+
+class PluginAssignmentUpdate(BaseModel):
+    """``PATCH /v1/plugins/{type}/{instance_id}`` body. All-optional."""
+
+    config: dict[str, object] | None = None
+    users: list[str] | None = None
+    paused: bool | None = None
+
+
 class PluginTypeRead(BaseModel):
     """One discovered plugin type as returned by ``GET /v1/plugins/types``.
 
