@@ -1,0 +1,5 @@
+type = "adguard"
+name = "AdGuard Home"
+version = "1.0.0"
+description = "Sinkhole DNS via AdGuard Home REST API. When a managed user is locked, every one of that user's managed devices with a known MAC gets its AdGuard client upstream set to the sinkhole address (default 0.0.0.0); on unlock, upstreams clear."
+config_schema = "Config"
