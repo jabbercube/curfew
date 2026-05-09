@@ -48,8 +48,61 @@ def configured_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[P
 
 
 @pytest.fixture
-def client(configured_db: Path) -> TestClient:
-    return TestClient(create_app())
+def client(configured_db: Path) -> Iterator[TestClient]:
+    """TestClient as a context manager so FastAPI lifespan fires.
+
+    Without the ``with`` block, ``startup``/``shutdown`` don't run and
+    ``app.state.plugin_runtime`` is never built — every route that
+    schedules reconciles would AttributeError. Yielding from the
+    fixture makes tests use the same lifecycle production does.
+    """
+    with TestClient(create_app()) as c:
+        yield c
+
+
+@pytest.fixture
+def configured_db_with_repo_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Path]:
+    """``configured_db`` variant that also points the loader at the repo plugins.
+
+    Tests that exercise plugin assignment / reconcile dispatch need a real
+    discovered plugin (the shipped ``reftest_plugin``). Setting
+    ``CURFEW_PLUGINS_DIRS`` to the repo's ``plugins/`` directory makes
+    discovery find it; the rest of the setup mirrors ``configured_db``.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    monkeypatch.setenv("CURFEW_PLUGINS_DIRS", str(repo_root / "plugins"))
+
+    db = tmp_path / "test.sqlite"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CURFEW_ROOT_TOKEN", "test-token")
+    monkeypatch.setenv("CURFEW_DB_PATH", str(db))
+    reset_config_cache()
+    reset_engine_cache()
+
+    api_dir = Path(__file__).resolve().parents[1]
+    cfg = Config(str(api_dir / "alembic.ini"))
+    cfg.set_main_option("script_location", str(api_dir / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", f"sqlite:///{db}")
+    command.upgrade(cfg, "head")
+
+    yield db
+
+    user_scope.reset()
+    reset_config_cache()
+    reset_engine_cache()
+
+
+@pytest.fixture
+def client_with_repo_plugins(configured_db_with_repo_plugins: Path) -> Iterator[TestClient]:
+    """``client`` variant with ``reftest_plugin`` discovered.
+
+    Used by plugin assignment / reconcile tests so they don't have to
+    synthesise a plugin folder per test.
+    """
+    with TestClient(create_app()) as c:
+        yield c
 
 
 @pytest.fixture
