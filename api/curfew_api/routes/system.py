@@ -29,7 +29,7 @@ from curfew.models import (
     AuditLog,
     Device,
     Manifest,
-    Plugin,
+    PluginAssignment,
     Settings,
     User,
     UserLock,
@@ -77,7 +77,11 @@ def get_snapshot(
         ],
         plugins=[
             PluginSnapshotRow.model_validate(r)
-            for r in session.exec(select(Plugin).order_by(Plugin.type, Plugin.instance_id))
+            for r in session.exec(
+                select(PluginAssignment).order_by(
+                    PluginAssignment.type, PluginAssignment.instance_id
+                )
+            )
         ],
         user_locks=[
             UserLockSnapshotRow.model_validate(r)

@@ -196,6 +196,24 @@ class AgentSnapshotRow(BaseModel):
     last_seen_version: str | None
 
 
+class PluginTypeRead(BaseModel):
+    """One discovered plugin type as returned by ``GET /v1/plugins/types``.
+
+    Reflects what the loader found at startup. ``error`` is non-null when
+    the plugin folder failed to load (missing manifest, no Plugin subclass,
+    bad imports, etc.); successfully-loaded plugins have ``error: null``
+    and the manifest fields populated.
+    """
+
+    type: str
+    name: str | None = None
+    version: str | None = None
+    description: str | None = None
+    config_schema: str | None = None
+    error: str | None = None
+    has_requirements_txt: bool = False
+
+
 class PluginSnapshotRow(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

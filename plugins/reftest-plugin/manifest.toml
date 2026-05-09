@@ -1,0 +1,5 @@
+type = "reftest_plugin"
+name = "Reference test plugin"
+version = "1.0.0"
+description = "No-op plugin used by the kernel acceptance test. Step 11 turns this into a sentinel-writing reconciler that exercises the dispatch/resync paths."
+config_schema = "Config"
