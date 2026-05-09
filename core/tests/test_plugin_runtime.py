@@ -278,7 +278,7 @@ def test_update_users_doesnt_reinstantiate(runtime: PluginRuntime) -> None:
     asyncio.run(go())
 
 
-def test_update_paused_doesnt_reinstantiate(runtime: PluginRuntime) -> None:
+def test_update_enabled_doesnt_reinstantiate(runtime: PluginRuntime) -> None:
     async def go() -> None:
         inst = runtime.build_instance("recorder", {})
         await runtime.register(
@@ -289,8 +289,8 @@ def test_update_paused_doesnt_reinstantiate(runtime: PluginRuntime) -> None:
             users=["*"],
         )
         baseline = _Recorder.init_count
-        live = await runtime.update(type_name="recorder", instance_id="default", paused=True)
-        assert live.paused is True
+        live = await runtime.update(type_name="recorder", instance_id="default", enabled=False)
+        assert live.enabled is False
         assert live.instance is inst
         assert _Recorder.init_count == baseline
 
@@ -404,7 +404,9 @@ def test_dispatch_wildcard_users(
     assert len(_Recorder.calls) == 1
 
 
-def test_dispatch_skips_paused(runtime: PluginRuntime, engine: Engine, kernel_rules: None) -> None:
+def test_dispatch_skips_disabled(
+    runtime: PluginRuntime, engine: Engine, kernel_rules: None
+) -> None:
     _seed_user(engine, "kid1")
 
     async def go() -> None:
@@ -414,7 +416,7 @@ def test_dispatch_skips_paused(runtime: PluginRuntime, engine: Engine, kernel_ru
             instance=runtime.build_instance("recorder", {}),
             config={},
             users=["*"],
-            paused=True,
+            enabled=False,
         )
         await runtime.dispatch_for_user("kid1")
 

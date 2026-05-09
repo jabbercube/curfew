@@ -50,7 +50,7 @@ def test_list_after_create(
     assert item["type"] == "reftest_plugin"
     assert item["instance_id"] == "default"
     assert item["users"] == ["*"]
-    assert item["paused"] is False
+    assert item["enabled"] is True
 
 
 # --- POST --------------------------------------------------------------------
@@ -168,7 +168,7 @@ def test_patch_users(
     assert r.json()["users"] == ["kid1", "kid2"]
 
 
-def test_patch_paused(
+def test_patch_enabled(
     client_with_repo_plugins: TestClient, auth: dict[str, str], tmp_path: Path
 ) -> None:
     client_with_repo_plugins.post(
@@ -178,11 +178,11 @@ def test_patch_paused(
     )
     r = client_with_repo_plugins.patch(
         "/v1/plugins/reftest_plugin/default",
-        json={"paused": True},
+        json={"enabled": False},
         headers=auth,
     )
     assert r.status_code == 200
-    assert r.json()["paused"] is True
+    assert r.json()["enabled"] is False
 
 
 def test_patch_config_invalid_422(

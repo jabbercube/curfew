@@ -69,7 +69,7 @@ The schema is created in the initial migration with all fields the system will e
 | `apps` | id (INTEGER PK), slug (UNIQUE indexed), exe_paths (JSON list), process_names (JSON list), urls (JSON list) |
 | `agents` | (device_id INTEGER PK, FK→devices.id), type, config JSON, last_heartbeat nullable, last_seen_version nullable — one row per device that has an agent installed. `type` and `config` are declarative (set at install, e.g. which Windows local user account to ACL); `last_heartbeat` and `last_seen_version` are runtime fields the agent updates on each tick. `last_heartbeat IS NULL` means the agent has never reported in (assigned but not yet bootstrapped). The kernel records this fact; it doesn't interpret stale heartbeats as an alert (a powered-off device looks the same as a broken agent without independent reachability data — see the Reachability monitoring feature) |
 | `agent_tokens` | id (INTEGER PK), token_hash (UNIQUE indexed), device_id (FK→devices.id), created_at, revoked_at — bearer per device, used by the agent on that device to authenticate. The auth path queries by `token_hash`; the CLI's management identifier is `id` so the API never leaks the hash through URLs or list responses. |
-| `plugins` | (type, instance_id) PK; config JSON; users JSON list (usernames, or `["*"]` for all managed users); paused bool. In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`. `instance_id` is the literal string `"default"` unless the operator needs multiple instances of the same type, in which case they pick a name. URL paths use both segments (`/v1/plugins/{type}/{instance_id}`); the CLI defaults the instance_id to `default` so single-instance plugins read naturally (`curfew plugin pause adguard`) |
+| `plugins` | (type, instance_id) PK; config JSON; users JSON list (usernames, or `["*"]` for all managed users); enabled bool (default `true`). In-core plugins are discovered from any directory listed in `CURFEW_PLUGINS_DIRS`. `instance_id` is the literal string `"default"` unless the operator needs multiple instances of the same type, in which case they pick a name. URL paths use both segments (`/v1/plugins/{type}/{instance_id}`); the CLI defaults the instance_id to `default` so single-instance plugins read naturally (`curfew plugin disable adguard`) |
 | `user_locks` | user_id (PK, FK→users.id), manual_lock (bool), set_at, set_by |
 | `audit_log` | id (INTEGER PK), actor, action, target_kind (enum: user/device/app/agent/plugin/settings/manifest), target_id (string — the target's username/slug at the time of the event; survives target deletion), payload (JSON), occurred_at. Indexed on `occurred_at` (for retention pruning) and `(target_kind, target_id)` (for "all events for kid1" queries). |
 | `manifests` | type (PK), version, sha256, url — versioned **agent** artifacts (plugins are not distributed this way; they're files on disk) |
@@ -178,7 +178,7 @@ plugins/
 2. **Assignment** (operator): `curfew plugin assign adguard --config '{"url": "..."}' --users '["*"]'`. Validates config against the plugin's Pydantic schema, inserts a row in `plugins`, instantiates the plugin in memory. **Convention: secrets stay in env, not in config.** A plugin needing a secret declares an `*_env` field (e.g. `api_token_env: "ADGUARD_TOKEN"`) and reads `os.environ[name]` at runtime; the config row holds only the env-var name. This keeps `state.sqlite` and `GET /v1/plugins` free of plaintext secrets.
 3. **Reconciliation** (event-driven, async to the originating request): when state changes for a user the plugin governs (lock toggled, schedule fired, etc.), curfew-core schedules `reconcile()` calls on every governing plugin as background tasks. The originating API request returns immediately after the database write; the reconciles fire in the background. A reconcile failure is logged and recorded in the audit log but doesn't fail the originating request — slow plugins don't delay the operator. Operators check the audit log if they need to confirm reconcile succeeded.
 4. **Safety-net resync** (slow tick, default every 5 minutes): curfew-core walks all governed users and calls `reconcile()` on each registered plugin instance for each governed user. Catches missed events from restarts.
-5. **Pause / unpause**: `curfew plugin pause adguard` flips a `paused` flag. The core stops calling reconcile until unpaused; the instance stays loaded and config is preserved.
+5. **Enable / disable**: `curfew plugin disable adguard` flips the `enabled` flag to `false`. The core stops calling reconcile until re-enabled; the instance stays loaded and config is preserved.
 6. **Removal**: `curfew plugin unassign adguard` deletes the row, drops the in-memory instance.
 
 **Plugin config update — decision deferred:** when an operator `PATCH`es a plugin's config, the in-memory instance was constructed with the old config. The kernel needs to handle this; options when implementation gets here:
@@ -376,10 +376,10 @@ Agents (per-device extension surface)
   DELETE /v1/devices/{device}/tokens/{id}       revoke
 
 Plugins (in-core extension surface)
-  GET    /v1/plugins                            list assigned plugin instances + paused/users/config
+  GET    /v1/plugins                            list assigned plugin instances + enabled/users/config
   GET    /v1/plugins/types                      list discovered plugin types from CURFEW_PLUGINS_DIRS + their config_schema
   POST   /v1/plugins                            body { type, instance_id?, config, users }; assigns a plugin (instance_id defaults to "default")
-  PATCH  /v1/plugins/{type}/{instance_id}       update config / users / paused for this instance
+  PATCH  /v1/plugins/{type}/{instance_id}       update config / users / enabled for this instance
   DELETE /v1/plugins/{type}/{instance_id}       unassign this instance
 
 Locks
@@ -421,7 +421,7 @@ curfew agent            install <type> <device> | uninstall <device> | list
 curfew agent token      mint <device> | list <device> | revoke <device> <id>
 curfew agent publish    <type> <version> <file>             # publish a new version of agent code
 
-curfew plugin           assign <type> [<instance_id>] | unassign <type> [<instance_id>] | pause <type> [<instance_id>] | unpause <type> [<instance_id>] | list | types
+curfew plugin           assign <type> [<instance_id>] | unassign <type> [<instance_id>] | enable <type> [<instance_id>] | disable <type> [<instance_id>] | list | types
 
 curfew setting          list | get | set
 curfew lock             <user>
@@ -429,7 +429,7 @@ curfew unlock           <user>
 curfew status                                                # human-readable summary
 
 # Convention: every list/show/status command accepts --json for machine-readable output.
-# Plugin commands take an optional <instance_id> positional arg; omitted means the literal "default" instance. So `curfew plugin pause adguard` works for the common case, and `curfew plugin pause smart-plug livingroom` addresses a specific non-default instance.
+# Plugin commands take an optional <instance_id> positional arg; omitted means the literal "default" instance. So `curfew plugin disable adguard` works for the common case, and `curfew plugin disable smart-plug livingroom` addresses a specific non-default instance.
 ```
 
 ## Repository layout
@@ -541,7 +541,7 @@ The kernel is "done" when both extension surfaces work end-to-end. Two reference
 12. CLI assigns the plugin (`curfew plugin assign reftest_plugin --config '{}' --users '["kid1"]'`).
 13. CLI locks `kid1` again; the core directly calls `reftest_plugin.reconcile()` (in-process); the plugin writes its sentinel.
 14. CLI unlocks; reconcile is called again; the plugin clears its sentinel.
-15. CLI pauses the plugin (`curfew plugin pause reftest_plugin`); subsequent state changes do not trigger reconcile.
+15. CLI disables the plugin (`curfew plugin disable reftest_plugin`); subsequent state changes do not trigger reconcile.
 16. CLI unassigns; the in-memory instance is dropped.
 
 **Cross-cutting:**

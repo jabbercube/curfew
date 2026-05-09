@@ -128,7 +128,7 @@ class Plugin:
     instance_id: str = PK (composite, default "default")
     config: dict[str, Any] = {}
     users: list[str] = []            # JSON; user slugs or ["*"] (renamed from governs)
-    paused: bool = False
+    enabled: bool = True
 
 class UserLock:
     user: str = PK + FK(User.slug)

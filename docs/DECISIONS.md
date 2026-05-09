@@ -102,7 +102,7 @@ A plugin is a Python class subclassing `Plugin` from the plugin SDK. Curfew-core
 **Decided:** desired state is declared in the database; runtime data either projects from it or is irrelevant.
 
 - **Agents:** `agents(device, type, config, last_heartbeat, last_seen_version)` — one row per device that has an agent installed. Declarative columns (`type`, `config`) are set at install; runtime columns (`last_heartbeat`, `last_seen_version`) start NULL and are updated by the agent's heartbeat. The kernel deliberately does *not* paint stale heartbeats as an alert — a powered-off device looks identical to a broken agent without independent reachability evidence (see the Reachability monitoring feature in PLAN.md). The desired/runtime split lives within one row rather than across two tables: the runtime side carries only two columns and never drifts independently from desired (no reconciliation controller; the agent reports back), so a separate projection table earned no keep.
-- **Plugins:** `plugins(type, instance_id, config, users, paused)` declares which plugins are assigned and how. There's no separate runtime-state table because plugins are in-process — their liveness *is* the core's. An assigned-but-paused plugin has its row but is skipped during reconciliation.
+- **Plugins:** `plugins(type, instance_id, config, users, enabled)` declares which plugins are assigned and how. There's no separate runtime-state table because plugins are in-process — their liveness *is* the core's. An assigned-but-disabled plugin (`enabled=false`) has its row but is skipped during reconciliation.
 
 **Rejected:**
 
@@ -250,7 +250,7 @@ plugins/
 
 - **Sidecar containers (one docker container per plugin, HTTP between core and plugin).** Higher friction for plugin authors (write a docker image + an HTTP server) without a corresponding benefit at homelab scale. The "language flexibility" argument doesn't apply for the audience curfew serves.
 - **Pip-installed plugins via setuptools entry points.** Standard but requires rebuilding the curfew-core image to add a plugin. Defeats the "drop a folder, restart" UX that the operator should expect.
-- **Hot-reload on file change.** Adds significant complexity (module unloading is tricky in Python) without enough payoff. Restarting curfew-core to pick up new plugin code is a few seconds; toggling existing plugins (pause / unpause) doesn't need a restart.
+- **Hot-reload on file change.** Adds significant complexity (module unloading is tricky in Python) without enough payoff. Restarting curfew-core to pick up new plugin code is a few seconds; toggling existing plugins (enable / disable) doesn't need a restart.
 - **Per-plugin Python sub-environments.** Python doesn't actually support per-module dependency isolation in one process — `sys.modules` is global, and pip-install with `--target` plus `sys.path` munging is fragile (transitive deps clobber each other). The honest model is one shared environment.
 
 **Trade-offs accepted:**

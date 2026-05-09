@@ -102,7 +102,7 @@ async def _hydrate_runtime(runtime: PluginRuntime) -> None:
                 instance=instance,
                 config=dict(row.config),
                 users=list(row.users),
-                paused=row.paused,
+                enabled=row.enabled,
             )
         except Exception:
             logger.exception(
