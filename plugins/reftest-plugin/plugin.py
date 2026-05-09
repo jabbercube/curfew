@@ -28,13 +28,20 @@ from pydantic import BaseModel
 
 
 class Config(BaseModel):
-    """Where to write the sentinel.
+    """Where to write the sentinels.
 
-    Tests typically point this at ``tmp_path / "sentinel"``; live smoke
-    tests use something like ``/tmp/curfew-reftest-sentinel``.
+    Tests typically point ``sentinel_path`` at ``tmp_path / "sentinel"``;
+    live smoke tests use something like ``/tmp/curfew-reftest-sentinel``.
+
+    ``devices_sentinel_path`` is an opt-in second sentinel that records
+    the comma-separated list of device slugs the kernel passed in
+    ``Scope.devices``. Used by the kernel acceptance test for the
+    ``Scope.devices`` extension; left ``None`` for the simpler tests
+    that just assert lock state propagated.
     """
 
     sentinel_path: str
+    devices_sentinel_path: str | None = None
 
 
 class ReftestPlugin(Plugin):
@@ -47,4 +54,12 @@ class ReftestPlugin(Plugin):
             path.write_text(scope.user)
         else:
             path.unlink(missing_ok=True)
+
+        if self.config.devices_sentinel_path is not None:
+            dpath = Path(self.config.devices_sentinel_path)
+            if scope.locked:
+                dpath.write_text(",".join(d.slug for d in scope.devices))
+            else:
+                dpath.unlink(missing_ok=True)
+
         return ReconcileResult.ok()

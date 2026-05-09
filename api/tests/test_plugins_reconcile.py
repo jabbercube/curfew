@@ -145,6 +145,54 @@ def test_failed_reconcile_audited_but_lock_succeeds(
     assert rows[0].payload["user"] == "kid1"
 
 
+def test_lock_dispatches_scope_devices(
+    client_with_repo_plugins: TestClient, auth: dict[str, str], tmp_path: Path
+) -> None:
+    """``Scope.devices`` reaches the plugin end-to-end via the lock route.
+
+    Two devices are seeded for kid1 with distinct MACs; the reftest
+    plugin records the comma-separated device-slug list it received in
+    ``Scope.devices`` to a second sentinel.
+    """
+    sentinel = tmp_path / "sentinel"
+    devices_sentinel = tmp_path / "devices"
+
+    r = client_with_repo_plugins.post(
+        "/v1/users",
+        json={"username": "kid1", "password": "test1234", "role": "member"},
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+    user_id = r.json()["id"]
+
+    for slug, mac in [("kid1-laptop", "aa:bb:cc:dd:ee:01"), ("kid1-phone", "aa:bb:cc:dd:ee:02")]:
+        r = client_with_repo_plugins.post(
+            "/v1/devices",
+            json={"slug": slug, "type": "pc", "os": "windows", "mac": [mac], "owner_id": user_id},
+            headers=auth,
+        )
+        assert r.status_code == 201, r.text
+
+    r = client_with_repo_plugins.post(
+        "/v1/plugins",
+        json={
+            "type": "reftest_plugin",
+            "config": {
+                "sentinel_path": str(sentinel),
+                "devices_sentinel_path": str(devices_sentinel),
+            },
+            "users": ["kid1"],
+        },
+        headers=auth,
+    )
+    assert r.status_code == 201, r.text
+
+    r = client_with_repo_plugins.post("/v1/users/kid1/lock", headers=auth)
+    assert r.status_code == 200
+    assert sentinel.read_text() == "kid1"
+    assert devices_sentinel.read_text() == "kid1-laptop,kid1-phone"
+
+
 def test_assignments_hydrate_on_startup(
     client_with_repo_plugins: TestClient, auth: dict[str, str], tmp_path: Path
 ) -> None:
